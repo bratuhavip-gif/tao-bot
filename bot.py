@@ -660,7 +660,16 @@ async def post_init(application: Application):
     logger.info("Scheduler started: price_watcher 2min / alert_scanner 15min / analysis 4h + 9:00")
 
 
-def _build_app():
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        logger.warning("Conflict в error_handler: ждём 40с и продолжаем")
+        await asyncio.sleep(40)
+    else:
+        logger.error("Unhandled error: %s", context.error)
+
+
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("analysis", cmd_analysis))
@@ -670,24 +679,10 @@ def _build_app():
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CallbackQueryHandler(cb_coin_analysis, pattern=r"^coin_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    return app
-
-
-async def _run_bot():
-    from telegram.error import Conflict
-    while True:
-        try:
-            app = _build_app()
-            logger.info("TAO Signal Bot v2 started")
-            await app.run_polling()
-            break
-        except Conflict:
-            logger.warning("Conflict: другой экземпляр активен. Жду 40с...")
-            await asyncio.sleep(40)
-        except Exception as exc:
-            logger.error("Ошибка: %s — перезапуск через 15с", exc)
-            await asyncio.sleep(15)
+    app.add_error_handler(error_handler)
+    logger.info("TAO Signal Bot v2 started")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(_run_bot())
+    main()
