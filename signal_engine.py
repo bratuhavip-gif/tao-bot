@@ -1,9 +1,9 @@
 """
 Signal engine — полный технический анализ TAO.
 
-Структура скора (max ±10 → нормируется):
-  Тренд / структура рынка  : ±3  (самый важный блок — гасит ложные сигналы)
-  RSI 1H + 4H              : ±2
+Структура скора (нормируется до ±10):
+  Тренд / структура рынка  : ±3  (главный фильтр — гасит ложные сигналы)
+  RSI 1H + 4H + Stoch      : ±3
   MACD 1H                  : ±2
   Уровни / BB              : ±2
   BTC направление          : ±1
@@ -12,7 +12,8 @@ Signal engine — полный технический анализ TAO.
   История (ATH distance)   : ±1
   Новости                  : ±1
 
-DOWNTREND LOCK: если тренд сильно медвежий → максимальный сигнал не выше "осторожно".
+DOWNTREND LOCK: если тренд сильно медвежий → сигнал не выше "осторожно" (+1).
+RESISTANCE LOCK: если цена у сопротивления → сигнал «входить» не отправляется.
 """
 
 
@@ -53,7 +54,7 @@ def generate_signal(data: dict, news: dict) -> dict:
     score += trend_score
     reasons += trend_reasons
 
-    # ── 2. RSI (±2) ──────────────────────────────────────────────────────────
+    # ── 2. RSI + STOCH (±3) ──────────────────────────────────────────────────
     s, r = _score_rsi(rsi_1h, rsi_4h, stoch)
     score += s; reasons += r
 
@@ -94,6 +95,15 @@ def generate_signal(data: dict, news: dict) -> dict:
             reasons.append("🔒 Сигнал зажат: тренд нисходящий — не входи против рынка")
             downtrend_locked = True
 
+    # ── RESISTANCE LOCK ───────────────────────────────────────────────────────
+    # Цена у сопротивления — убираем «входить», это потолок
+    resistance_locked = False
+    if resistance and price and price >= resistance * 0.985:
+        if score >= 3:
+            score = min(score, 2)
+            reasons.append(f"🔒 Сигнал снижен: цена у сопротивления ${resistance:,.2f} — не входи у потолка")
+            resistance_locked = True
+
     score = max(-10, min(10, score))
 
     plan = _build_action_plan(score, price, support, resistance, rsi_1h, rsi_4h,
@@ -105,7 +115,7 @@ def generate_signal(data: dict, news: dict) -> dict:
     elif score >= 3:
         signal = "🟢 ВХОДИТЬ"
     elif score >= 1:
-        signal = "🟡 МОЖНО ВОЙТИ (осторожно)"
+        signal = "🟡 ОСТОРОЖНО (малой частью)"
     elif score <= -5:
         signal = "🔴 ВЫХОДИТЬ / НЕ ВХОДИТЬ"
     elif score <= -3:
@@ -121,18 +131,21 @@ def generate_signal(data: dict, news: dict) -> dict:
         "reasons": reasons,
         "plan": plan,
         "downtrend_locked": downtrend_locked,
+        "resistance_locked": resistance_locked,
         "trend_score": trend_score,
     }
 
 
 def quick_signal_score(data: dict) -> int:
-    """Быстрый скор для alert_scanner. Включает trend lock."""
+    """Быстрый скор для alert_scanner. Идентичная логика locks с generate_signal."""
     score = 0
     tao        = data.get("tao", {})
     btc        = data.get("btc", {})
     price      = tao.get("price", 0)
     btc_change = btc.get("change_24h", 0)
     rsi_1h     = data.get("rsi_1h", 50)
+    rsi_4h     = data.get("rsi_4h", 50)
+    stoch      = data.get("stoch_rsi_1h", {})
     levels     = data.get("levels", {})
     macd       = data.get("macd_1h", {})
     bb         = data.get("bb_1h", {})
@@ -145,38 +158,60 @@ def quick_signal_score(data: dict) -> int:
     ema200     = daily.get("ema200")
 
     # BTC
-    if btc_change > 2:   score += 1
+    if btc_change > 2:    score += 1
     elif btc_change < -3: score -= 2
     elif btc_change < 0:  score -= 1
 
-    # RSI
-    if rsi_1h < 30:   score += 2
-    elif rsi_1h < 42: score += 1
-    elif rsi_1h > 70: score -= 2
-    elif rsi_1h > 60: score -= 1
+    # RSI 1H — исправлены пороги (BUG #4, #10)
+    if rsi_1h < 25:       score += 3
+    elif rsi_1h < 35:     score += 2
+    elif rsi_1h < 45:     score += 1
+    elif rsi_1h > 80:     score -= 3
+    elif rsi_1h > 70:     score -= 2
+    elif rsi_1h > 60:     score -= 1
+
+    # RSI 4H
+    if rsi_4h < 35:       score += 1
+    elif rsi_4h > 65:     score -= 1
+
+    # Stoch RSI
+    k = stoch.get("k", 50)
+    d = stoch.get("d", 50)
+    if k < 20 and d < 20:      score += 1
+    elif k > 80 and d > 80:    score -= 1
 
     # MACD
     cross = macd.get("cross", "none")
     if cross == "bullish":  score += 2
     elif cross == "bearish": score -= 2
 
-    # Уровни
-    if support and price and price <= support * 1.02:  score += 2
-    if resistance and price and price >= resistance * 0.98: score -= 2
+    # Уровни — исправлено: elif чтобы не суммировались (BUG #3), единые 1.5% (BUG #12)
+    if support and price and price <= support * 1.015:
+        score += 2
+    elif resistance and price and price >= resistance * 0.985:
+        score -= 2
 
     # BB
     bb_lower = bb.get("lower", 0)
     bb_upper = bb.get("upper", 0)
-    if bb_lower and price and price <= bb_lower * 1.01: score += 1
-    if bb_upper and price and price >= bb_upper * 0.99: score -= 1
+    if bb_lower and price and price <= bb_lower * 1.01:
+        score += 1
+    elif bb_upper and price and price >= bb_upper * 0.99:
+        score -= 1
 
-    # Тренд (краткосрочный: серия lower lows)
+    # Тренд
     trend_score = _quick_trend_score(trend, price, ma20, ma50, ema200)
     score += trend_score
 
-    # Downtrend lock
-    if trend_score <= -2 and score > 1:
-        score = 1
+    # Downtrend lock — та же логика что в generate_signal (BUG #2)
+    if trend_score <= -2:
+        if score > 1:
+            score = 1
+
+    # Resistance lock (BUG #7)
+    if resistance and price and price >= resistance * 0.985:
+        if score >= 3:
+            score = 2
 
     return max(-10, min(10, score))
 
@@ -241,7 +276,6 @@ def format_report(data: dict, news: dict, signal_data: dict) -> str:
     lines.append(f"🎯 Поддержка: ${support:,.4g}  |  Сопр: ${resistance:,.4g}")
 
     bb_lower = bb.get("lower", 0)
-    bb_mid   = bb.get("mid", 0)
     bb_upper = bb.get("upper", 0)
     if bb_lower and bb_upper:
         if price <= bb_lower * 1.01:
@@ -249,7 +283,7 @@ def format_report(data: dict, news: dict, signal_data: dict) -> str:
         elif price >= bb_upper * 0.99:
             bb_pos = "▲ у верхней полосы (перекуплен)"
         else:
-            bb_pos = f"середина диапазона"
+            bb_pos = "середина диапазона"
         lines.append(f"📐 BB: ${bb_lower:,.2f} — ${bb_upper:,.2f}  ({bb_pos})")
 
     if ma20 and ma50:
@@ -260,9 +294,7 @@ def format_report(data: dict, news: dict, signal_data: dict) -> str:
         ema_e = "✅" if price > ema200 else "🔴"
         lines.append(f"{ema_e} EMA200d: ${ema200:,.2f}")
 
-    # Тренд
     trend_dir   = trend.get("direction", "")
-    trend_str   = trend.get("desc", "")
     consec_down = trend.get("consecutive_down", 0)
     consec_up   = trend.get("consecutive_up", 0)
     if trend_dir == "down":
@@ -272,13 +304,11 @@ def format_report(data: dict, news: dict, signal_data: dict) -> str:
     else:
         lines.append(f"↔️ Тренд: боковик")
 
-    # Order book
     bid_ask = ob.get("bid_ask_ratio", 0)
     if bid_ask:
         ob_str = "покупатели доминируют" if bid_ask > 1.2 else ("продавцы доминируют" if bid_ask < 0.8 else "баланс")
         lines.append(f"📖 Стакан: {ob_str} (bid/ask {bid_ask:.2f})")
 
-    # История
     if weekly:
         ath       = weekly.get("ath", 0)
         pct_ath   = weekly.get("pct_from_ath", 0)
@@ -356,9 +386,7 @@ def _score_trend(price, trend, ma20, ma50, ema200, change_24h, daily):
     consec_up    = trend.get("consecutive_up", 0)
     lower_lows   = trend.get("lower_lows", False)
     higher_highs = trend.get("higher_highs", False)
-    slope_1h     = trend.get("slope_1h", 0)
 
-    # Серия нисходящих свечей подряд — главный фильтр
     if consec_down >= 4:
         score -= 3
         reasons.append(f"🔴 {consec_down} свечей подряд вниз — сильный нисходящий импульс, не входи")
@@ -372,7 +400,6 @@ def _score_trend(price, trend, ma20, ma50, ema200, change_24h, daily):
         score += 1
         reasons.append(f"🟡 {consec_up} свечи подряд вверх — слабый бычий импульс")
 
-    # Lower lows / Higher highs (структура рынка)
     if lower_lows:
         score -= 1
         reasons.append("🔴 Структура рынка: lower lows — рынок делает новые минимумы")
@@ -380,7 +407,6 @@ def _score_trend(price, trend, ma20, ma50, ema200, change_24h, daily):
         score += 1
         reasons.append("✅ Структура рынка: higher highs — рынок делает новые максимумы")
 
-    # MA-фильтр
     if price and ma20 and ma50:
         if price < ma20 < ma50:
             score -= 1
@@ -415,27 +441,33 @@ def _quick_trend_score(trend, price, ma20, ma50, ema200):
     if lower_lows: score -= 1
 
     if price and ma20 and ma50:
-        if price < ma20 < ma50: score -= 1
+        if price < ma20 < ma50:   score -= 1
         elif price > ma20 > ma50: score += 1
+
+    if price and ema200:
+        if price < ema200 * 0.98: score -= 1
+        elif price > ema200 * 1.02: score += 1
 
     return max(-3, min(3, score))
 
 
 def _score_rsi(rsi_1h, rsi_4h, stoch):
+    """RSI 1H/4H + Stoch RSI. Исправлены пороги (BUG #4, #10)."""
     score, reasons = 0, []
 
+    # RSI 1H — дифференцированы экстремальные уровни
     if rsi_1h < 25:
-        score += 2
+        score += 3
         reasons.append(f"✅ RSI 1H = {rsi_1h} — экстремальная перепроданность, разворот очень вероятен")
     elif rsi_1h < 35:
         score += 2
         reasons.append(f"✅ RSI 1H = {rsi_1h} — перепродан, отскок вероятен")
     elif rsi_1h < 45:
         score += 1
-        reasons.append(f"🟡 RSI 1H = {rsi_1h} — зона покупки")
+        reasons.append(f"🟡 RSI 1H = {rsi_1h} — слабая зона покупки")
     elif rsi_1h > 80:
-        score -= 2
-        reasons.append(f"🔴 RSI 1H = {rsi_1h} — экстремальная перекупленность")
+        score -= 3
+        reasons.append(f"🔴 RSI 1H = {rsi_1h} — экстремальная перекупленность, выход")
     elif rsi_1h > 70:
         score -= 2
         reasons.append(f"🔴 RSI 1H = {rsi_1h} — перекуплен, не входи в лонг")
@@ -445,6 +477,7 @@ def _score_rsi(rsi_1h, rsi_4h, stoch):
     else:
         reasons.append(f"⚪ RSI 1H = {rsi_1h} — нейтральная зона")
 
+    # RSI 4H — подтверждение
     if rsi_4h < 35:
         score += 1
         reasons.append(f"✅ RSI 4H = {rsi_4h} — на 4H тоже перепродан (двойное подтверждение)")
@@ -465,7 +498,7 @@ def _score_rsi(rsi_1h, rsi_4h, stoch):
         score += 1
         reasons.append(f"✅ Stoch RSI кросс вверх в зоне перепроданности")
 
-    return max(-2, min(2, score)), reasons
+    return max(-3, min(3, score)), reasons
 
 
 def _score_macd(macd_1h):
@@ -473,8 +506,7 @@ def _score_macd(macd_1h):
     cross    = macd_1h.get("cross", "none")
     macd_val = macd_1h.get("macd", 0)
     sig_val  = macd_1h.get("signal", 0)
-    hist     = macd_1h.get("histogram", 0)
-    hist_dir = macd_1h.get("histogram_dir", "")  # growing / shrinking
+    hist_dir = macd_1h.get("histogram_dir", "")
 
     if cross == "bullish":
         score += 2
@@ -501,6 +533,7 @@ def _score_macd(macd_1h):
 
 
 def _score_levels_bb(price, support, resistance, bb):
+    """Уровни — использует elif чтобы поддержка и сопр не суммировались (BUG #3)."""
     score, reasons = 0, []
 
     if support and resistance and price:
@@ -510,14 +543,12 @@ def _score_levels_bb(price, support, resistance, bb):
             reasons.append(f"✅ Цена у поддержки ${support:,.2f} — хорошая точка входа")
         elif price >= resistance * 0.985:
             score -= 2
-            reasons.append(f"🔴 Цена у сопротивления ${resistance:,.2f} — не входи")
+            reasons.append(f"🔴 Цена у сопротивления ${resistance:,.2f} — не входи у потолка")
         else:
             reasons.append(f"⚪ Цена в диапазоне ${support:,.2f}–${resistance:,.2f} ({zone_pct:.0f}% от низа)")
 
-    # Bollinger Bands
     bb_lower = bb.get("lower", 0)
     bb_upper = bb.get("upper", 0)
-    bb_mid   = bb.get("mid", 0)
     bb_width = bb.get("width_pct", 0)
 
     if bb_lower and bb_upper and price:
@@ -572,12 +603,6 @@ def _score_volume(levels, change_24h, ob):
             reasons.append(f"🔴 Объём выше среднего ×{vol_ratio:.1f} на падении — давление продавцов")
     else:
         reasons.append(f"⚪ Объём обычный")
-
-    bid_ask = ob.get("bid_ask_ratio", 0)
-    if bid_ask > 1.3:
-        score += 0  # не добавляем, но показываем в репорте
-    elif bid_ask and bid_ask < 0.7:
-        score -= 0
 
     return max(-1, min(1, score)), reasons
 
@@ -647,42 +672,46 @@ def _score_news(news):
 def _build_action_plan(score, price, support, resistance, rsi_1h, rsi_4h,
                        btc_change, change_24h, fg_value, weekly, daily,
                        bb, trend, downtrend_locked):
-    pct_from_ath   = weekly.get("pct_from_ath")
-    trend_4w       = weekly.get("trend_4w", 0)
-    trend_30d      = daily.get("trend_30d", 0)
-    ma20           = daily.get("ma20")
-    ma50           = daily.get("ma50")
-    ema200         = daily.get("ema200")
-    ath            = weekly.get("ath", 0)
+    pct_from_ath    = weekly.get("pct_from_ath")
+    trend_4w        = weekly.get("trend_4w", 0)
+    trend_30d       = daily.get("trend_30d", 0)
+    ma20            = daily.get("ma20")
+    ma50            = daily.get("ma50")
+    ema200          = daily.get("ema200")
+    ath             = weekly.get("ath", 0)
     key_resistances = weekly.get("key_resistances", [])
-    key_supports   = weekly.get("key_supports", [])
-    consec_down    = trend.get("consecutive_down", 0)
-    bb_lower       = bb.get("lower", 0)
-    bb_upper       = bb.get("upper", 0)
+    key_supports    = weekly.get("key_supports", [])
+    consec_down     = trend.get("consecutive_down", 0)
+    bb_lower        = bb.get("lower", 0)
+    bb_upper        = bb.get("upper", 0)
+
+    # Защита от инвалидного support/resistance (BUG #8)
+    support_valid    = support and support > 0 and support < price * 0.999
+    resistance_valid = resistance and resistance > 0 and resistance > price * 1.001
 
     # Точка входа
     if downtrend_locked or consec_down >= 3:
-        entry = f"НЕ ВХОДИТЬ — тренд нисходящий ({consec_down} свечей вниз). Жди разворота: две зелёных свечи подряд + RSI < 40"
+        entry = f"НЕ ВХОДИТЬ — тренд нисходящий ({consec_down} свечей вниз). Жди разворота: 2 зелёных свечи + RSI < 40"
+    elif resistance_valid and price >= resistance * 0.985:
+        entry = f"НЕ ВХОДИТЬ у сопротивления ${resistance:,.1f} — жди пробоя или отката"
     elif score >= 5:
         entry = f"Сейчас (~${price:,.1f}) — условия оптимальные"
     elif score >= 3:
-        # Откат к поддержке имеет смысл только если поддержка НИЖЕ текущей цены
-        if support and support < price * 0.99:
+        if support_valid and support < price * 0.99:
             entry = f"Сейчас малой частью, основную — при откате до ${support*1.01:,.1f}"
         else:
             entry = f"Малой частью сейчас (~${price:,.1f}), жди подтверждения"
-    elif support and support < price * 0.97:
-        # Поддержка заметно ниже — имеет смысл ждать
+    elif support_valid and support < price * 0.97:
         entry = f"Жди отката до ${support*1.01:,.1f}–${support*1.02:,.1f}"
     elif bb_lower and bb_lower < price * 0.97:
         entry = f"Жди отката к нижней BB (${bb_lower:,.1f})"
     elif ma50 and ma50 < price * 0.95:
         entry = f"Жди отката к MA50 (${ma50:,.1f})"
     else:
-        entry = f"Сейчас (~${price:,.1f}) или не входить — жди разворота с объёмом"
+        entry = f"Нет чёткой точки — жди разворота с объёмом"
 
     # Тейк-профит
-    if resistance and price < resistance * 0.95:
+    if resistance_valid and price < resistance * 0.95:
         tp1 = round(price * 1.025, 1)
         tp2 = round(resistance * 0.98, 1)
         take_profit = f"TP1: ${tp1:,.1f} (+2.5%) → TP2: ${tp2:,.1f} (сопр)"
@@ -695,7 +724,7 @@ def _build_action_plan(score, price, support, resistance, rsi_1h, rsi_4h,
             take_profit = f"TP1: ${tp1:,.1f} (+2.5%) → TP2: ${price*1.05:,.1f} (+5%)"
 
     # Стоп-лосс
-    if support and price > support:
+    if support_valid:
         stop_loss = f"${support*0.985:,.1f} (ниже поддержки)"
     elif bb_lower and price > bb_lower:
         stop_loss = f"${bb_lower*0.99:,.1f} (ниже нижней BB)"
@@ -718,7 +747,7 @@ def _build_action_plan(score, price, support, resistance, rsi_1h, rsi_4h,
     else:
         recheck = "Через 2–4 часа"
 
-    # Контекст
+    # Исторический контекст
     parts = []
     if pct_from_ath is not None:
         parts.append(f"От ATH {abs(pct_from_ath):.0f}% вниз (ATH: ${ath:,.0f})")
@@ -733,6 +762,8 @@ def _build_action_plan(score, price, support, resistance, rsi_1h, rsi_4h,
     # Риск
     if consec_down >= 3 or downtrend_locked:
         risk = "ВЫСОКИЙ — активный нисходящий тренд"
+    elif resistance_valid and price >= resistance * 0.985:
+        risk = "ВЫСОКИЙ — цена у сопротивления"
     elif rsi_1h > 70 and change_24h > 5:
         risk = "ВЫСОКИЙ — RSI перегрет + сильный рост за день"
     elif pct_from_ath and pct_from_ath > -15:

@@ -18,13 +18,17 @@ CHAT_ID        = os.environ.get("CHAT_ID")
 # ─── глобальное состояние ────────────────────────────────────────────────────
 alerts_enabled    = True
 last_alert_score  = 0
-last_alert_ts     = 0.0   # время последнего алерта (антиспам: минимум 20 мин между одинаковыми)
-_atl_alert_sent        = 0.0   # цена при ATL-алерте
+last_alert_ts     = 0.0
+_atl_alert_sent   = 0.0
 
-# Bottom pattern алерты
-_bottom_alert_ts       = 0.0   # время последнего bottom алерта
-_capitulation_alert_ts = 0.0   # время последнего capitulation алерта
-_triple_bottom_level   = 0.0   # уровень последнего triple bottom алерта
+# Bottom pattern алерты — раздельные кулдауны (BUG #6)
+_triple_bottom_alert_ts  = 0.0
+_capitulation_alert_ts   = 0.0
+_combo_bottom_alert_ts   = 0.0
+_triple_bottom_level     = 0.0
+
+# Нисходящий тренд — отдельный кулдаун (BUG #9)
+_downtrend_warning_ts    = 0.0
 
 # Ценовой трекер
 _price_ref        = 0.0
@@ -211,9 +215,10 @@ async def price_watcher(context):
 # ─── alert_scanner (каждые 15 мин) ───────────────────────────────────────────
 
 async def alert_scanner(context):
-    """Комплексный сигнал: RSI + MACD + тренд + BTC + уровни. С downtrend lock."""
+    """Комплексный сигнал: RSI + MACD + тренд + BTC + уровни."""
     global last_alert_score, last_alert_ts, alerts_enabled, _atl_alert_sent
-    global _bottom_alert_ts, _capitulation_alert_ts, _triple_bottom_level
+    global _triple_bottom_alert_ts, _capitulation_alert_ts, _combo_bottom_alert_ts
+    global _triple_bottom_level, _downtrend_warning_ts
 
     if not alerts_enabled:
         return
@@ -294,19 +299,19 @@ async def alert_scanner(context):
     rsi_div         = bottom.get("rsi_divergence", False)
     hammer          = bottom.get("hammer_reversal", False)
 
-    # 1. Тройное/четвертное дно — сильнейший сигнал
+    # ── 1. Тройное/четвертное дно — сильнейший сигнал ──────────────────────────
     if triple_bottom and bottom_level > 0:
         level_changed = abs(bottom_level - _triple_bottom_level) > bottom_level * 0.03
-        cooldown_ok   = now - _bottom_alert_ts >= 3600  # не чаще 1 раза в час
+        cooldown_ok   = now - _triple_bottom_alert_ts >= 3600  # раздельный кулдаун (BUG #6)
 
         if cooldown_ok and level_changed:
             extra_signals = []
-            if vol_climax:    extra_signals.append(f"📊 Объём {vol_ratio:.1f}x — продавцы выдохлись")
-            if rsi_div:       extra_signals.append("📈 RSI дивергенция — разворот подтверждён")
-            if hammer:        extra_signals.append("🔨 Молот на уровне — покупатели защищают дно")
-            if capit_drop:    extra_signals.append(f"💥 Перед этим был резкий дамп {abs(drop_pct):.1f}% — паника выкуплена")
+            if vol_climax: extra_signals.append(f"📊 Объём {vol_ratio:.1f}x — продавцы выдохлись")
+            if rsi_div:    extra_signals.append("📈 RSI дивергенция — разворот подтверждён")
+            if hammer:     extra_signals.append("🔨 Молот на уровне — покупатели защищают дно")
+            if capit_drop: extra_signals.append(f"💥 Перед этим был дамп {abs(drop_pct):.1f}% — паника выкуплена")
 
-            extra_str = ("\n" + "\n".join(extra_signals)) if extra_signals else ""
+            extra_str  = ("\n" + "\n".join(extra_signals)) if extra_signals else ""
             confidence = "🔥 ОЧЕНЬ ВЫСОКАЯ" if bottom_score >= 6 else "⚡ ВЫСОКАЯ" if bottom_score >= 4 else "🟡 СРЕДНЯЯ"
 
             msg = (
@@ -317,20 +322,20 @@ async def alert_scanner(context):
                 f"📊 Сила сигнала: {confidence} ({bottom_score}/10)\n"
                 f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n"
                 f"{extra_str}\n\n"
-                f"📌 ЛОГИКА: рынок 3+ раз отбился от одного уровня — продавцы истощены, покупатели держат.\n"
+                f"📌 Рынок 3+ раз отбился от одного уровня — продавцы истощены.\n"
                 f"Чем больше касаний = тем сильнее поддержка.\n\n"
                 f"💡 Тактика: вход частями у ${bottom_level:,.2f}, стоп ниже ${bottom_level * 0.97:,.2f}\n"
                 f"Цель 1: ${bottom_level * 1.1:,.2f} (+10%)  |  Цель 2: ${bottom_level * 1.2:,.2f} (+20%)"
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            _bottom_alert_ts     = now
-            _triple_bottom_level = bottom_level
+            _triple_bottom_alert_ts = now
+            _triple_bottom_level    = bottom_level
             logger.info(f"TRIPLE BOTTOM alert: level={bottom_level:.2f} touches={bottom_touches} score={bottom_score}")
 
-    # 2. Капитуляция — резкое падение без причины
+    # ── 2. Капитуляция — резкое падение без причины ─────────────────────────
     if capit_drop and not triple_bottom:
-        cooldown_ok = now - _capitulation_alert_ts >= 1800  # не чаще раза в 30 мин
-        if cooldown_ok and abs(drop_pct) >= 5.0:
+        cooldown_ok = now - _capitulation_alert_ts >= 1800
+        if cooldown_ok:
             extra_signals = []
             if vol_climax: extra_signals.append(f"📊 Объём взлетел в {vol_ratio:.1f}x — паническая продажа")
             if rsi_div:    extra_signals.append("📈 RSI дивергенция — импульс падения слабеет")
@@ -346,36 +351,39 @@ async def alert_scanner(context):
                 f"⚡ Интенсивность: {intensity}\n"
                 f"📉 RSI 1H: {rsi}  |  Страх/жадность: {data.get('fear_greed',{}).get('value',50)}\n"
                 f"{extra_str}\n\n"
-                f"📌 ЛОГИКА: резкое падение без тренда = паническая продажа.\n"
-                f"После капитуляций статистически часто идёт быстрый отскок +5–15%.\n\n"
-                f"⚠️ НЕ входи сразу — жди стабилизации цены (2 свечи без новых лоу).\n"
-                f"Уровень поддержки: ${support:,.2f}"
+                f"📌 Резкое падение без тренда = паническая продажа.\n"
+                f"После капитуляций статистически часто идёт отскок +5–15%.\n\n"
+                f"⚠️ НЕ входи сразу — жди стабилизации (2 свечи без новых лоу).\n"
+                f"Поддержка: ${support:,.2f}"
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
             _capitulation_alert_ts = now
             logger.info(f"CAPITULATION alert: drop={drop_pct:.1f}% score={bottom_score}")
 
-    # 3. Комбо-сигнал: несколько bottom-паттернов одновременно (без тройного дна)
-    elif not triple_bottom and not capit_drop and bottom_score >= 4:
-        cooldown_ok = now - _bottom_alert_ts >= 2700  # 45 мин
+    # ── 3. Комбо-сигнал: нужен объём + ≥5 баллов (BUG #5, раздельный кулдаун BUG #6)
+    elif not triple_bottom and not capit_drop and bottom_score >= 5 and vol_climax:
+        cooldown_ok = now - _combo_bottom_alert_ts >= 2700  # раздельный кулдаун
         if cooldown_ok:
             signals_str = "\n".join(f"• {d}" for d in bottom_desc)
             msg = (
                 f"🟢 ЗОНА НАКОПЛЕНИЯ — TAO\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Цена: ${price:,.2f}  |  Сила сигнала: {bottom_score}/10\n"
-                f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n\n"
+                f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n"
+                f"📊 Объём {vol_ratio:.1f}x от среднего — покупатели входят\n\n"
                 f"Зафиксированы паттерны дна:\n{signals_str}\n\n"
                 f"💡 Рассмотри вход небольшой частью позиции"
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            _bottom_alert_ts = now
-            logger.info(f"COMBO bottom alert: score={bottom_score} patterns={len(bottom_desc)}")
+            _combo_bottom_alert_ts = now
+            logger.info(f"COMBO bottom alert: score={bottom_score} vol={vol_ratio:.1f}x patterns={len(bottom_desc)}")
 
-    # ── Нисходящий тренд — предупреждение ────────────────────────────────────
-    # Если тренд нисходящий и скор всё равно ≥ 0 — напомнить что не время входить
-    if direction == "down" and consec_down >= 3 and last_alert_score >= 0 and score <= 1:
-        if now - last_alert_ts >= 1800:  # не чаще раза в 30 мин
+    # ── Нисходящий тренд — предупреждение (BUG #9: раздельный кулдаун) ──────
+    if direction == "down" and consec_down >= 3 and score <= 1:
+        # Шлём только когда скор ТОЛЬКО ЧТО упал ниже 2 или прошёл кулдаун
+        score_just_dropped = last_alert_score >= 2
+        cooldown_ok        = now - _downtrend_warning_ts >= 3600  # не чаще раза в час
+        if score_just_dropped or cooldown_ok:
             stoch_k = stoch.get("k", 50)
             msg = (
                 f"⚠️ TAO: АКТИВНЫЙ НИСХОДЯЩИЙ ТРЕНД\n"
@@ -383,23 +391,24 @@ async def alert_scanner(context):
                 f"💰 ${price:,.2f}  |  Счёт: {score:+d}/10\n"
                 f"📉 {consec_down} свечей подряд вниз\n"
                 f"RSI 1H: {rsi}  |  Stoch RSI K: {stoch_k:.0f}\n\n"
-                f"🔒 Бот заблокировал сигнал входа — не торгуй против тренда\n"
+                f"🔒 Сигнал заблокирован — не торгуй против тренда\n"
                 f"Жди: 2 зелёных свечи подряд + RSI разворот"
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            last_alert_ts = now
+            _downtrend_warning_ts = now
             logger.info(f"alert_scanner: downtrend warning sent consec={consec_down}")
         last_alert_score = score
         return
 
-    # ── Позитивные сигналы — антиспам: 20 мин между отправками ──────────────
+    # ── Позитивные / негативные сигналы ──────────────────────────────────────
+    # BUG #1 и #14 исправлены: last_alert_score обновляется ТОЛЬКО после отправки
     if score >= 5 and last_alert_score < 5:
+        # Кулдаун: если последний алерт был ≥4 менее 20 мин назад — пропускаем
         if now - last_alert_ts < 1200 and last_alert_score >= 4:
-            last_alert_score = score
-            return
+            return  # не обновляем last_alert_score (BUG #14)
+        stoch_k  = stoch.get("k", 50)
         macd_str = "\n⚡ MACD бычий кросс — импульс пошёл" if macd_cross == "bullish" else ""
         sup_str  = f"\n🎯 Поддержка: ${support:,.2f}" if support else ""
-        stoch_k  = stoch.get("k", 50)
         stoch_str = f"\n🎲 Stoch RSI: {stoch_k:.0f} (перепродан)" if stoch_k < 25 else ""
         bb_lower = bb.get("lower", 0)
         bb_str   = f"\n📐 У нижней BB (${bb_lower:,.2f})" if bb_lower and price <= bb_lower * 1.01 else ""
@@ -412,32 +421,32 @@ async def alert_scanner(context):
             f"👉 «📊 Анализ TAO» — полный план"
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts = now
-        logger.info(f"alert_scanner: STRONG ENTRY score={score}")
+        last_alert_ts    = now
+        last_alert_score = score  # обновляем только после отправки
 
     elif score >= 3 and last_alert_score < 3:
         if now - last_alert_ts < 1200:
-            last_alert_score = score
-            return
+            return  # не обновляем last_alert_score (BUG #14)
         msg = (
             f"🟢 TAO — ВХОДИТЬ\n"
             f"💰 ${price:,.2f}  |  RSI {rsi}  |  Счёт {score:+d}/10\n"
             f"Условия хорошие. Смотри полный анализ для точки входа."
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts = now
+        last_alert_ts    = now
+        last_alert_score = score
 
     elif score >= 1 and last_alert_score < 1:
         if now - last_alert_ts < 2400:
-            last_alert_score = score
             return
         msg = (
             f"🟡 TAO — МОЖНО ВОЙТИ МАЛОЙ ЧАСТЬЮ\n"
             f"💰 ${price:,.2f}  |  RSI {rsi}  |  Счёт {score:+d}/10\n"
-            f"Неплохо, но осторожно. Жди подтверждения."
+            f"Слабый сигнал — только малой частью и с подтверждением."
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts = now
+        last_alert_ts    = now
+        last_alert_score = score
 
     elif score <= -4 and last_alert_score > -4:
         msg = (
@@ -448,9 +457,12 @@ async def alert_scanner(context):
             f"Жди разворота."
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts = now
+        last_alert_ts    = now
+        last_alert_score = score
 
-    last_alert_score = score
+    else:
+        # Нет нового алерта — всё равно обновляем скор для следующего цикла
+        last_alert_score = score
 
 
 # ─── команды ─────────────────────────────────────────────────────────────────
