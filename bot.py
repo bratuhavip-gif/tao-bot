@@ -1,10 +1,11 @@
 import os
 import time
+import asyncio
 import logging
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonCommands
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from data_collector import collect_all_data, quick_scan_coin, AI_COINS, get_tao_ticker, get_binance_klines, calculate_support_resistance, detect_trend
+from data_collector import collect_all_data, quick_scan_coin, AI_COINS, get_tao_ticker, get_binance_klines, calculate_support_resistance, detect_trend, detect_bottom_patterns
 from news_fetcher import get_all_news
 from signal_engine import generate_signal, format_report, quick_signal_score
 
@@ -18,7 +19,12 @@ CHAT_ID        = os.environ.get("CHAT_ID")
 alerts_enabled    = True
 last_alert_score  = 0
 last_alert_ts     = 0.0   # время последнего алерта (антиспам: минимум 20 мин между одинаковыми)
-_atl_alert_sent   = 0.0   # цена при ATL-алерте
+_atl_alert_sent        = 0.0   # цена при ATL-алерте
+
+# Bottom pattern алерты
+_bottom_alert_ts       = 0.0   # время последнего bottom алерта
+_capitulation_alert_ts = 0.0   # время последнего capitulation алерта
+_triple_bottom_level   = 0.0   # уровень последнего triple bottom алерта
 
 # Ценовой трекер
 _price_ref        = 0.0
@@ -207,6 +213,7 @@ async def price_watcher(context):
 async def alert_scanner(context):
     """Комплексный сигнал: RSI + MACD + тренд + BTC + уровни. С downtrend lock."""
     global last_alert_score, last_alert_ts, alerts_enabled, _atl_alert_sent
+    global _bottom_alert_ts, _capitulation_alert_ts, _triple_bottom_level
 
     if not alerts_enabled:
         return
@@ -272,6 +279,98 @@ async def alert_scanner(context):
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
                 _atl_alert_sent = price
                 logger.info(f"alert_scanner: ATL zone price={price:.2f} pct={pct_from_atl:.1f}%")
+
+    # ── BOTTOM PATTERNS — главный блок новых алертов ─────────────────────────
+    bottom = data.get("bottom", {})
+    bottom_score    = bottom.get("bottom_score", 0)
+    bottom_desc     = bottom.get("description", [])
+    triple_bottom   = bottom.get("multiple_bottom", False)
+    bottom_level    = bottom.get("bottom_level", 0.0)
+    bottom_touches  = bottom.get("bottom_touches", 0)
+    capit_drop      = bottom.get("capitulation_drop", False)
+    drop_pct        = bottom.get("drop_pct", 0.0)
+    vol_climax      = bottom.get("volume_climax", False)
+    vol_ratio       = bottom.get("volume_climax_ratio", 0.0)
+    rsi_div         = bottom.get("rsi_divergence", False)
+    hammer          = bottom.get("hammer_reversal", False)
+
+    # 1. Тройное/четвертное дно — сильнейший сигнал
+    if triple_bottom and bottom_level > 0:
+        level_changed = abs(bottom_level - _triple_bottom_level) > bottom_level * 0.03
+        cooldown_ok   = now - _bottom_alert_ts >= 3600  # не чаще 1 раза в час
+
+        if cooldown_ok and level_changed:
+            extra_signals = []
+            if vol_climax:    extra_signals.append(f"📊 Объём {vol_ratio:.1f}x — продавцы выдохлись")
+            if rsi_div:       extra_signals.append("📈 RSI дивергенция — разворот подтверждён")
+            if hammer:        extra_signals.append("🔨 Молот на уровне — покупатели защищают дно")
+            if capit_drop:    extra_signals.append(f"💥 Перед этим был резкий дамп {abs(drop_pct):.1f}% — паника выкуплена")
+
+            extra_str = ("\n" + "\n".join(extra_signals)) if extra_signals else ""
+            confidence = "🔥 ОЧЕНЬ ВЫСОКАЯ" if bottom_score >= 6 else "⚡ ВЫСОКАЯ" if bottom_score >= 4 else "🟡 СРЕДНЯЯ"
+
+            msg = (
+                f"🔁 ТРОЙНОЕ ДНО — TAO | ТОЧКА ВХОДА\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Цена: ${price:,.2f}\n"
+                f"🎯 Уровень поддержки: ${bottom_level:,.2f}  ({bottom_touches} касания)\n"
+                f"📊 Сила сигнала: {confidence} ({bottom_score}/10)\n"
+                f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n"
+                f"{extra_str}\n\n"
+                f"📌 ЛОГИКА: рынок 3+ раз отбился от одного уровня — продавцы истощены, покупатели держат.\n"
+                f"Чем больше касаний = тем сильнее поддержка.\n\n"
+                f"💡 Тактика: вход частями у ${bottom_level:,.2f}, стоп ниже ${bottom_level * 0.97:,.2f}\n"
+                f"Цель 1: ${bottom_level * 1.1:,.2f} (+10%)  |  Цель 2: ${bottom_level * 1.2:,.2f} (+20%)"
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
+            _bottom_alert_ts     = now
+            _triple_bottom_level = bottom_level
+            logger.info(f"TRIPLE BOTTOM alert: level={bottom_level:.2f} touches={bottom_touches} score={bottom_score}")
+
+    # 2. Капитуляция — резкое падение без причины
+    if capit_drop and not triple_bottom:
+        cooldown_ok = now - _capitulation_alert_ts >= 1800  # не чаще раза в 30 мин
+        if cooldown_ok and abs(drop_pct) >= 5.0:
+            extra_signals = []
+            if vol_climax: extra_signals.append(f"📊 Объём взлетел в {vol_ratio:.1f}x — паническая продажа")
+            if rsi_div:    extra_signals.append("📈 RSI дивергенция — импульс падения слабеет")
+            if hammer:     extra_signals.append("🔨 Молот на последней свече — первый признак разворота")
+            if rsi < 30:   extra_signals.append(f"💎 RSI {rsi} — перепродан, отскок вероятен")
+            extra_str = ("\n" + "\n".join(extra_signals)) if extra_signals else ""
+
+            intensity = "🔴 СИЛЬНАЯ" if abs(drop_pct) >= 8 else "🟠 УМЕРЕННАЯ"
+            msg = (
+                f"💥 КАПИТУЛЯЦИЯ — TAO УПАЛ ИЗ НИОТКУДА\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Цена: ${price:,.2f}  ({drop_pct:.1f}% за 3 свечи)\n"
+                f"⚡ Интенсивность: {intensity}\n"
+                f"📉 RSI 1H: {rsi}  |  Страх/жадность: {data.get('fear_greed',{}).get('value',50)}\n"
+                f"{extra_str}\n\n"
+                f"📌 ЛОГИКА: резкое падение без тренда = паническая продажа.\n"
+                f"После капитуляций статистически часто идёт быстрый отскок +5–15%.\n\n"
+                f"⚠️ НЕ входи сразу — жди стабилизации цены (2 свечи без новых лоу).\n"
+                f"Уровень поддержки: ${support:,.2f}"
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
+            _capitulation_alert_ts = now
+            logger.info(f"CAPITULATION alert: drop={drop_pct:.1f}% score={bottom_score}")
+
+    # 3. Комбо-сигнал: несколько bottom-паттернов одновременно (без тройного дна)
+    elif not triple_bottom and not capit_drop and bottom_score >= 4:
+        cooldown_ok = now - _bottom_alert_ts >= 2700  # 45 мин
+        if cooldown_ok:
+            signals_str = "\n".join(f"• {d}" for d in bottom_desc)
+            msg = (
+                f"🟢 ЗОНА НАКОПЛЕНИЯ — TAO\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Цена: ${price:,.2f}  |  Сила сигнала: {bottom_score}/10\n"
+                f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n\n"
+                f"Зафиксированы паттерны дна:\n{signals_str}\n\n"
+                f"💡 Рассмотри вход небольшой частью позиции"
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
+            _bottom_alert_ts = now
+            logger.info(f"COMBO bottom alert: score={bottom_score} patterns={len(bottom_desc)}")
 
     # ── Нисходящий тренд — предупреждение ────────────────────────────────────
     # Если тренд нисходящий и скор всё равно ≥ 0 — напомнить что не время входить
@@ -561,7 +660,7 @@ async def post_init(application: Application):
     logger.info("Scheduler started: price_watcher 2min / alert_scanner 15min / analysis 4h + 9:00")
 
 
-def main():
+def _build_app():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("analysis", cmd_analysis))
@@ -571,9 +670,24 @@ def main():
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CallbackQueryHandler(cb_coin_analysis, pattern=r"^coin_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("TAO Signal Bot v2 started")
-    app.run_polling()
+    return app
+
+
+async def _run_bot():
+    from telegram.error import Conflict
+    while True:
+        try:
+            app = _build_app()
+            logger.info("TAO Signal Bot v2 started")
+            await app.run_polling()
+            break
+        except Conflict:
+            logger.warning("Conflict: другой экземпляр активен. Жду 40с...")
+            await asyncio.sleep(40)
+        except Exception as exc:
+            logger.error("Ошибка: %s — перезапуск через 15с", exc)
+            await asyncio.sleep(15)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(_run_bot())

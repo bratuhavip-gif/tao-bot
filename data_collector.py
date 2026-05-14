@@ -314,6 +314,143 @@ def detect_trend(candles: list) -> dict:
     }
 
 
+def detect_bottom_patterns(candles_1h: list, candles_4h: list, candles_daily: list) -> dict:
+    """
+    Детектирует паттерны дна и капитуляции:
+
+    1. multiple_bottom — 3-4 касания одного уровня поддержки (±2%) на разных ТФ
+    2. capitulation_drop — резкое падение -5%+ за 1-3 свечи без предпосылок (BTC рос или боком)
+    3. volume_climax — огромный объём на падении (капитуляция продавцов)
+    4. rsi_divergence — цена обновила лоу, RSI нет (бычья дивергенция)
+    5. hammer_reversal — молот/пин-бар на уровне поддержки (тень вниз > 2x тела)
+    """
+    result = {
+        "multiple_bottom":   False,
+        "bottom_level":      0.0,
+        "bottom_touches":    0,
+        "capitulation_drop": False,
+        "drop_pct":          0.0,
+        "drop_candles":      0,
+        "volume_climax":     False,
+        "volume_climax_ratio": 0.0,
+        "rsi_divergence":    False,
+        "hammer_reversal":   False,
+        "bottom_score":      0,   # суммарная сила сигнала 0-10
+        "description":       [],
+    }
+
+    desc = []
+
+    # ── 1. Multiple bottom (тройное/четвертное дно) ───────────────────────────
+    # Ищем кластеры локальных минимумов на 4H свечах
+    if len(candles_4h) >= 20:
+        lows_4h = [c["low"] for c in candles_4h[-40:]]
+        # Находим локальные минимумы (свеча ниже соседей)
+        local_lows = []
+        for i in range(1, len(lows_4h) - 1):
+            if lows_4h[i] < lows_4h[i-1] and lows_4h[i] < lows_4h[i+1]:
+                local_lows.append(lows_4h[i])
+
+        if len(local_lows) >= 3:
+            # Проверяем есть ли кластер (3+ минимума в пределах 2% друг от друга)
+            local_lows_sorted = sorted(local_lows)
+            base = local_lows_sorted[0]
+            cluster = [l for l in local_lows_sorted if l <= base * 1.02]
+            if len(cluster) >= 3:
+                result["multiple_bottom"] = True
+                result["bottom_level"]    = round(base, 2)
+                result["bottom_touches"]  = len(cluster)
+                result["bottom_score"]   += 3
+                desc.append(f"🔁 {len(cluster)}x дно на уровне ${base:.2f} (±2%)")
+
+    # ── 2. Capitulation drop — резкое падение «из ниоткуда» ─────────────────
+    # Падение -5%+ за последние 3 свечи 1H при нейтральном/боковом начале
+    if len(candles_1h) >= 6:
+        recent = candles_1h[-6:]
+        # Первые 3 свечи — контекст (не было сильного тренда)
+        pre_drop = recent[:3]
+        drop_candles = recent[3:]
+        pre_change = (pre_drop[-1]["close"] - pre_drop[0]["open"]) / pre_drop[0]["open"] * 100
+        drop_change = (drop_candles[-1]["close"] - drop_candles[0]["open"]) / drop_candles[0]["open"] * 100
+
+        if drop_change <= -5.0 and abs(pre_change) < 3.0:
+            result["capitulation_drop"] = True
+            result["drop_pct"]          = round(drop_change, 2)
+            result["drop_candles"]      = 3
+            result["bottom_score"]     += 2
+            desc.append(f"💥 Капитуляция: -{abs(drop_change):.1f}% за 3 свечи из бокового рынка")
+        elif drop_change <= -8.0:
+            result["capitulation_drop"] = True
+            result["drop_pct"]          = round(drop_change, 2)
+            result["drop_candles"]      = 3
+            result["bottom_score"]     += 3
+            desc.append(f"💥 Резкое падение: -{abs(drop_change):.1f}% за 3 свечи — капитуляция")
+
+    # ── 3. Volume climax — огромный объём на свече падения ───────────────────
+    if len(candles_1h) >= 20:
+        volumes = [c["volume"] for c in candles_1h]
+        avg_vol = sum(volumes[:-3]) / max(len(volumes[:-3]), 1)
+        # Смотрим максимальный объём в последних 3 свечах
+        recent_max_vol = max(c["volume"] for c in candles_1h[-3:])
+        vol_ratio = recent_max_vol / avg_vol if avg_vol else 1.0
+
+        if vol_ratio >= 3.0:
+            # Проверяем что это была свеча падения
+            biggest_vol_candle = max(candles_1h[-3:], key=lambda c: c["volume"])
+            if biggest_vol_candle["close"] < biggest_vol_candle["open"]:
+                result["volume_climax"]       = True
+                result["volume_climax_ratio"] = round(vol_ratio, 1)
+                result["bottom_score"]       += 2
+                desc.append(f"📊 Volume climax: объём {vol_ratio:.1f}x от среднего на медвежьей свече")
+        elif vol_ratio >= 2.0:
+            biggest_vol_candle = max(candles_1h[-3:], key=lambda c: c["volume"])
+            if biggest_vol_candle["close"] < biggest_vol_candle["open"]:
+                result["volume_climax"]       = True
+                result["volume_climax_ratio"] = round(vol_ratio, 1)
+                result["bottom_score"]       += 1
+                desc.append(f"📊 Повышенный объём: {vol_ratio:.1f}x от среднего на падении")
+
+    # ── 4. RSI бычья дивергенция (цена ниже, RSI выше предыдущего лоу) ───────
+    if len(candles_1h) >= 30:
+        # Сравниваем два последних локальных лоу по цене и RSI
+        closes = [c["close"] for c in candles_1h]
+        # Находим предпоследний локальный минимум
+        min_idx_last = len(closes) - 1
+        min_idx_prev = None
+        for i in range(len(closes) - 2, 5, -1):
+            if closes[i] < closes[i-1] and closes[i] < closes[i+1]:
+                if min_idx_prev is None:
+                    min_idx_prev = i
+                    break
+
+        if min_idx_prev is not None:
+            price_last = closes[min_idx_last]
+            price_prev = closes[min_idx_prev]
+            # RSI на этих точках
+            rsi_last = calculate_rsi(candles_1h[:min_idx_last+1])
+            rsi_prev = calculate_rsi(candles_1h[:min_idx_prev+1])
+
+            if price_last < price_prev and rsi_last > rsi_prev + 5:
+                result["rsi_divergence"] = True
+                result["bottom_score"] += 2
+                desc.append(f"📈 RSI дивергенция: цена ниже (${price_last:.2f} < ${price_prev:.2f}), RSI выше ({rsi_last:.0f} > {rsi_prev:.0f})")
+
+    # ── 5. Hammer / Pin bar на уровне поддержки ──────────────────────────────
+    if candles_1h:
+        last = candles_1h[-1]
+        body  = abs(last["close"] - last["open"])
+        lower = min(last["close"], last["open"]) - last["low"]
+        upper = last["high"] - max(last["close"], last["open"])
+        if body > 0 and lower >= body * 2 and upper <= body * 0.5:
+            result["hammer_reversal"] = True
+            result["bottom_score"]   += 1
+            desc.append(f"🔨 Молот/пин-бар: нижняя тень {lower/body:.1f}x от тела")
+
+    result["description"] = desc
+    result["bottom_score"] = min(result["bottom_score"], 10)
+    return result
+
+
 def get_order_book_ratio(symbol="TAOUSDT", depth=20) -> dict:
     """Соотношение bid/ask объёмов в стакане — быстрый индикатор давления."""
     try:
@@ -441,8 +578,9 @@ def collect_all_data(symbol: str = "TAOUSDT") -> dict:
     btc       = get_btc_ticker()
     fg        = get_fear_greed()
 
-    candles_1h = get_binance_klines(symbol, "1h", 60)
-    candles_4h = get_binance_klines(symbol, "4h", 40)
+    candles_1h    = get_binance_klines(symbol, "1h", 60)
+    candles_4h    = get_binance_klines(symbol, "4h", 40)
+    candles_daily = get_binance_klines(symbol, "1d", 30)
 
     history = get_tao_history() if symbol == "TAOUSDT" else _get_coin_history(symbol)
 
@@ -454,6 +592,7 @@ def collect_all_data(symbol: str = "TAOUSDT") -> dict:
     levels     = calculate_support_resistance(candles_1h)
     trend      = detect_trend(candles_1h)
     order_book = get_order_book_ratio(symbol)
+    bottom     = detect_bottom_patterns(candles_1h, candles_4h, candles_daily)
 
     return {
         "tao":           coin,
@@ -468,6 +607,7 @@ def collect_all_data(symbol: str = "TAOUSDT") -> dict:
         "trend":         trend,
         "order_book":    order_book,
         "history":       history,
+        "bottom":        bottom,
         "symbol":        symbol,
         "timestamp":     datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
     }
