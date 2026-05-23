@@ -1,3 +1,17 @@
+"""
+TAO Signal Bot v4 — скальпинговые сигналы ВХОД/ВЫХОД.
+
+Расписание:
+  price_watcher  — каждую 1 минуту: мгновенные движения цены
+  signal_scanner — каждые 10 минут: полный анализ, сигналы ВОЙТИ / ВЫЙТИ
+  full_report    — каждые 6 часов + 9:00: развёрнутый отчёт
+
+Логика алертов:
+  Сигнал ВОЙТИ  → score >= 4 (несколько подтверждений снизу)
+  Сигнал ВЫЙТИ  → score <= -4 (несколько подтверждений сверху)
+  Быстрый дроп  → -1.5% за 1 мин → предупреждение
+  Быстрый рост  → +1.5% за 1 мин → предупреждение о пике
+"""
 import os
 import time
 import asyncio
@@ -5,63 +19,77 @@ import logging
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonCommands
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from data_collector import collect_all_data, quick_scan_coin, AI_COINS, get_tao_ticker, get_binance_klines, calculate_support_resistance, detect_trend, detect_bottom_patterns
+
+# Загружаем .env (локальный запуск)
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+from data_collector import (
+    collect_all_data, quick_scan_coin, AI_COINS,
+    get_tao_ticker, get_klines, calculate_support_resistance, detect_trend,
+    detect_bottom_patterns, get_binance_klines,
+)
 from news_fetcher import get_all_news
 from signal_engine import generate_signal, format_report, quick_signal_score
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID        = os.environ.get("CHAT_ID")
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID         = os.environ.get("CHAT_ID")
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY")
 
-# ─── глобальное состояние ────────────────────────────────────────────────────
-alerts_enabled    = True
-last_alert_score  = 0
-last_alert_ts     = 0.0
-_atl_alert_sent   = 0.0
+# Claude клиент (lazy init)
+_claude = None
+def _get_claude():
+    global _claude
+    if _claude is None and ANTHROPIC_KEY:
+        import anthropic
+        _claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    return _claude
 
-# Bottom pattern алерты — раздельные кулдауны (BUG #6)
-_triple_bottom_alert_ts  = 0.0
-_capitulation_alert_ts   = 0.0
-_combo_bottom_alert_ts   = 0.0
-_triple_bottom_level     = 0.0
+# ─── состояние ────────────────────────────────────────────────────────────────
+alerts_enabled   = True
 
-# Нисходящий тренд — отдельный кулдаун (BUG #9)
-_downtrend_warning_ts    = 0.0
+# Скор из прошлого цикла (для отслеживания смены сигнала)
+_last_score      = 0
+_last_alert_ts   = 0.0
+_last_signal_dir = ""   # "buy" | "sell" | ""
 
-# Ценовой трекер
-_price_ref        = 0.0
-_price_ref_ts     = 0.0
-_price_last       = 0.0
-_price_alert_sent: dict = {}
-_last_support     = 0.0
-_last_trend_dir   = ""    # последнее известное направление тренда
+# Price watcher
+_prev_price      = 0.0
+_prev_price_ts   = 0.0
+_price_alert_cd  = {}   # cooldown на тип алерта
 
-# ─── клавиатуры ──────────────────────────────────────────────────────────────
-KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["📊 Анализ TAO", "📰 Новости"],
-        ["🪙 AI Монеты",  "🔔 Алерты: ВКЛ"],
-        ["⚙️ Помощь"],
-    ],
-    resize_keyboard=True
-)
-KEYBOARD_ALERTS_OFF = ReplyKeyboardMarkup(
-    [
-        ["📊 Анализ TAO", "📰 Новости"],
-        ["🪙 AI Монеты",  "🔔 Алерты: ВЫКЛ"],
-        ["⚙️ Помощь"],
-    ],
-    resize_keyboard=True
-)
+# Bottom patterns
+_bottom_alert_ts = 0.0
+_capit_alert_ts  = 0.0
 
-def get_keyboard():
-    return KEYBOARD if alerts_enabled else KEYBOARD_ALERTS_OFF
+# Downtrend warning
+_downtrend_ts    = 0.0
+
+# ATL
+_atl_alert_sent  = 0.0
 
 
-# ─── анализ ──────────────────────────────────────────────────────────────────
+# ─── клавиатура ───────────────────────────────────────────────────────────────
+def _kb(alerts_on: bool) -> ReplyKeyboardMarkup:
+    status = "ВКЛ 🔔" if alerts_on else "ВЫКЛ 🔕"
+    return ReplyKeyboardMarkup(
+        [["📊 Анализ TAO", "📰 Новости"],
+         ["🪙 AI Монеты",  f"🔔 Алерты: {status}"],
+         ["⚙️ Помощь"]],
+        resize_keyboard=True,
+    )
 
+
+# ─── отправка анализа ─────────────────────────────────────────────────────────
 async def run_analysis(context=None, update=None, symbol: str = "TAOUSDT"):
     chat_id = CHAT_ID
     try:
@@ -74,417 +102,403 @@ async def run_analysis(context=None, update=None, symbol: str = "TAOUSDT"):
         signal = generate_signal(data, news)
         report = format_report(data, news, signal)
 
-        kb = get_keyboard() if update else None
+        kb = _kb(alerts_enabled) if update else None
         await context.bot.send_message(chat_id=chat_id, text=report, reply_markup=kb)
-
     except Exception as e:
-        logger.error(f"Analysis error ({symbol}): {e}")
+        logger.error(f"run_analysis error ({symbol}): {e}")
         if update:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)[:120]}")
 
 
-# ─── price_watcher (каждые 2 мин) ────────────────────────────────────────────
-
+# ─── price_watcher (каждую 1 мин) ────────────────────────────────────────────
 async def price_watcher(context):
-    """Быстрые ценовые алерты: дроп, поддержка, отскок, тренд-смена."""
-    global _price_ref, _price_ref_ts, _price_last, _price_alert_sent, _last_support, _last_trend_dir, alerts_enabled
+    """
+    Мгновенные алерты:
+    - Резкий дроп -1.5% за 1 мин → предупреждение
+    - Резкий рост +1.5% за 1 мин → предупреждение о пике
+    - Цена вошла в зону поддержки → рассмотри вход
+    - Цена вошла в зону сопротивления → готовься к выходу
+    """
+    global _prev_price, _prev_price_ts, _price_alert_cd, alerts_enabled
 
     if not alerts_enabled:
         return
 
     ticker = get_tao_ticker()
     if ticker.get("error") or not ticker.get("price"):
-        logger.warning(f"price_watcher: ticker error: {ticker.get('error')}")
         return
 
     price = ticker["price"]
     now   = time.time()
 
-    # Первый запуск — инициализация
-    if _price_ref == 0:
-        _price_ref        = price
-        _price_ref_ts     = now
-        _price_last       = price
-        _price_alert_sent = {}
-        candles = get_binance_klines("TAOUSDT", "1h", 22)
-        lvl     = calculate_support_resistance(candles)
-        trend   = detect_trend(candles)
-        _last_support   = lvl.get("support", 0)
-        _last_trend_dir = trend.get("direction", "")
-        logger.info(f"price_watcher init: ref=${price:.2f} support=${_last_support:.2f} trend={_last_trend_dir}")
+    if _prev_price == 0:
+        _prev_price    = price
+        _prev_price_ts = now
+        # Загружаем уровни при старте
+        try:
+            c1h = get_klines("TAOUSDT", "1h", 60)
+            c4h = get_klines("TAOUSDT", "4h", 40)
+            lvl = calculate_support_resistance(c1h, c4h)
+            context.bot_data["support"]    = lvl.get("support", 0)
+            context.bot_data["resistance"] = lvl.get("resistance", 0)
+            logger.info(f"price_watcher init: ${price:.2f} sup=${lvl.get('support'):.2f} res={lvl.get('resistance'):.2f}")
+        except Exception:
+            pass
         return
 
-    # Сброс референса каждые 30 мин
-    if now - _price_ref_ts >= 1800:
-        candles = get_binance_klines("TAOUSDT", "1h", 22)
-        lvl     = calculate_support_resistance(candles)
-        trend   = detect_trend(candles)
-        new_trend_dir = trend.get("direction", "")
-
-        # Смена тренда — важное событие
-        if _last_trend_dir and new_trend_dir and new_trend_dir != _last_trend_dir:
-            if new_trend_dir == "down" and _last_trend_dir in ("up", "sideways"):
-                msg = (
-                    f"⚠️ TAO: ТРЕНД РАЗВЕРНУЛСЯ ВНИЗ\n"
-                    f"💰 ${price:,.2f}\n"
-                    f"📉 Серия нисходящих свечей началась. Осторожно — не входи против тренда.\n"
-                    f"Жди стабилизации."
-                )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-                logger.info(f"price_watcher: trend reversal down sent")
-            elif new_trend_dir == "up" and _last_trend_dir in ("down", "sideways"):
-                msg = (
-                    f"✅ TAO: ТРЕНД РАЗВЕРНУЛСЯ ВВЕРХ\n"
-                    f"💰 ${price:,.2f}\n"
-                    f"📈 Серия восходящих свечей. Смотри RSI и объём — возможен вход."
-                )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-                logger.info(f"price_watcher: trend reversal up sent")
-
-        _last_support   = lvl.get("support", 0)
-        _last_trend_dir = new_trend_dir
-        _price_ref      = price
-        _price_ref_ts   = now
-        _price_alert_sent = {}
-        _price_last     = price
-        logger.info(f"price_watcher reset: ref=${price:.2f} support=${_last_support:.2f} trend={_last_trend_dir}")
+    # Сброс кулдаунов каждые 20 минут
+    if now - _prev_price_ts >= 1200:
+        _price_alert_cd = {}
+        _prev_price     = price
+        _prev_price_ts  = now
+        # Обновляем уровни
+        try:
+            c1h = get_klines("TAOUSDT", "1h", 60)
+            c4h = get_klines("TAOUSDT", "4h", 40)
+            lvl = calculate_support_resistance(c1h, c4h)
+            context.bot_data["support"]    = lvl.get("support", 0)
+            context.bot_data["resistance"] = lvl.get("resistance", 0)
+        except Exception:
+            pass
         return
 
-    drop_pct        = (_price_ref - price) / _price_ref * 100 if _price_ref else 0
-    drop_pct_fast   = (_price_last - price) / _price_last * 100 if _price_last else 0  # дроп с прошлого тика (2 мин)
-    bounce_pct      = (price - _price_last) / _price_last * 100 if _price_last else 0
-    support         = _last_support
+    change_pct = (price - _prev_price) / _prev_price * 100 if _prev_price else 0
+    support    = context.bot_data.get("support", 0)
+    resistance = context.bot_data.get("resistance", 0)
 
     msgs = []
 
-    # Резкое падение за 2 мин (между тиками) — самый важный алерт
-    if drop_pct_fast >= 1.5 and "fast_drop" not in _price_alert_sent:
+    # Резкий дроп за 1 минуту
+    if change_pct <= -1.5 and "fast_drop" not in _price_alert_cd:
         msgs.append(
-            f"⚡ TAO РЕЗКИЙ ДРОП -{drop_pct_fast:.1f}% за 2 мин\n"
-            f"💰 ${price:,.2f}  (был ${_price_last:,.2f})\n"
-            f"🔴 НЕ ВХОДИ — жди стабилизации и разворота"
+            f"⚡ TAO РЕЗКИЙ ДРОП\n"
+            f"💰 ${price:,.2f}  ({change_pct:.1f}% за 1 мин)\n"
+            f"⚠️ Не входи сразу — жди стабилизации\n"
+            f"Если RSI < 35 и цена у поддержки — можно смотреть вход"
         )
-        _price_alert_sent["fast_drop"] = price
+        _price_alert_cd["fast_drop"] = now
 
-    # Падение -2% от 30-минутного референса
-    if drop_pct >= 2.0 and "drop2" not in _price_alert_sent:
+    # Резкий рост за 1 минуту
+    elif change_pct >= 1.5 and "fast_pump" not in _price_alert_cd:
         msgs.append(
-            f"📉 TAO -{drop_pct:.1f}% за 30 мин\n"
-            f"💰 ${price:,.2f}  (был ${_price_ref:,.2f})\n"
-            f"👀 Следи — возможна точка входа после стабилизации"
+            f"🚀 TAO РЕЗКИЙ РОСТ\n"
+            f"💰 ${price:,.2f}  (+{change_pct:.1f}% за 1 мин)\n"
+            f"⚠️ Если ты в позиции — подумай о фиксации части прибыли\n"
+            f"Не входи на пике — жди отката"
         )
-        _price_alert_sent["drop2"] = price
+        _price_alert_cd["fast_pump"] = now
 
-    # Падение -5% — серьёзный сигнал
-    if drop_pct >= 5.0 and "drop5" not in _price_alert_sent:
-        msgs.append(
-            f"🔻 TAO -{drop_pct:.1f}% — СИЛЬНЫЙ ДРОП\n"
-            f"💰 ${price:,.2f}\n"
-            f"⚡ Проверь RSI и тренд — НЕ ВХОДИ пока нет разворота"
-        )
-        _price_alert_sent["drop5"] = price
-
-    # Цена у поддержки (±1.5%) — только если тренд не нисходящий
-    if support and "support" not in _price_alert_sent and _last_trend_dir != "down":
-        dist_pct = abs(price - support) / support * 100
-        if dist_pct <= 1.5:
+    # Цена вошла в зону поддержки
+    if support and "near_support" not in _price_alert_cd:
+        dist = (price - support) / support * 100
+        if 0 <= dist <= 1.5:
             msgs.append(
-                f"🎯 TAO У ПОДДЕРЖКИ — РАССМОТРИ ВХОД\n"
+                f"🎯 TAO У ПОДДЕРЖКИ\n"
                 f"💰 ${price:,.2f}  |  Поддержка: ${support:,.2f}\n"
-                f"🟢 Отскок отсюда исторически высокий (проверь RSI)"
+                f"📊 Нажми «Анализ TAO» для подтверждения входа"
             )
-            _price_alert_sent["support"] = price
+            _price_alert_cd["near_support"] = now
 
-    # Отскок после падения — тренд начал разворачиваться
-    if "drop2" in _price_alert_sent and "bounce" not in _price_alert_sent:
-        if bounce_pct >= 1.5:
+    # Цена вошла в зону сопротивления
+    if resistance and "near_resistance" not in _price_alert_cd:
+        dist = (resistance - price) / resistance * 100
+        if 0 <= dist <= 1.5:
             msgs.append(
-                f"🔄 TAO отскочил +{bounce_pct:.1f}% — ИМПУЛЬС ВВЕРХ\n"
-                f"💰 ${price:,.2f}\n"
-                f"Смотри объём — если растёт, можно заходить"
+                f"🚧 TAO У СОПРОТИВЛЕНИЯ\n"
+                f"💰 ${price:,.2f}  |  Сопр: ${resistance:,.2f}\n"
+                f"⚠️ Зона продажи — если в позиции, рассмотри выход\n"
+                f"Не открывай новый лонг здесь"
             )
-            _price_alert_sent["bounce"] = price
+            _price_alert_cd["near_resistance"] = now
 
     for m in msgs:
-        logger.info(f"price alert: {m[:50]}")
-        await context.bot.send_message(chat_id=CHAT_ID, text=m, reply_markup=get_keyboard())
+        logger.info(f"price_watcher: {m[:60]}")
+        await context.bot.send_message(chat_id=CHAT_ID, text=m, reply_markup=_kb(alerts_enabled))
 
-    _price_last = price
+    _prev_price = price
 
 
-# ─── alert_scanner (каждые 15 мин) ───────────────────────────────────────────
-
-async def alert_scanner(context):
-    """Комплексный сигнал: RSI + MACD + тренд + BTC + уровни."""
-    global last_alert_score, last_alert_ts, alerts_enabled, _atl_alert_sent
-    global _triple_bottom_alert_ts, _capitulation_alert_ts, _combo_bottom_alert_ts
-    global _triple_bottom_level, _downtrend_warning_ts
+# ─── signal_scanner (каждые 10 мин) ──────────────────────────────────────────
+async def signal_scanner(context):
+    """
+    Главный сканер: полный анализ каждые 10 минут.
+    Шлёт алерт при смене направления сигнала:
+    - score >= 4  → ВОЙТИ
+    - score <= -4 → ВЫЙТИ / НЕ ВХОДИТЬ
+    - Нисходящий тренд 4H → предупреждение
+    """
+    global _last_score, _last_alert_ts, _last_signal_dir
+    global _bottom_alert_ts, _capit_alert_ts, _downtrend_ts, _atl_alert_sent
+    global alerts_enabled
 
     if not alerts_enabled:
         return
 
-    data = collect_all_data("TAOUSDT")
-    if data.get("tao", {}).get("error"):
-        logger.warning("alert_scanner: data error")
+    try:
+        data = collect_all_data("TAOUSDT")
+    except Exception as e:
+        logger.error(f"signal_scanner collect_all_data: {e}")
         return
 
-    score     = quick_signal_score(data)
-    price     = data.get("tao", {}).get("price", 0)
-    rsi       = data.get("rsi_1h", 50)
-    macd      = data.get("macd_1h", {})
-    macd_cross = macd.get("cross", "none")
-    support   = data.get("levels", {}).get("support", 0)
-    trend     = data.get("trend", {})
-    stoch     = data.get("stoch_rsi_1h", {})
-    bb        = data.get("bb_1h", {})
+    if data.get("tao", {}).get("error"):
+        logger.warning("signal_scanner: data error")
+        return
 
-    consec_down = trend.get("consecutive_down", 0)
-    consec_up   = trend.get("consecutive_up", 0)
-    direction   = trend.get("direction", "")
+    score    = quick_signal_score(data)
+    price    = data.get("tao", {}).get("price", 0)
+    rsi_1h   = data.get("rsi_1h", 50)
+    rsi_4h   = data.get("rsi_4h", 50)
+    stoch    = data.get("stoch_rsi_1h", {})
+    macd_1h  = data.get("macd_1h", {})
+    levels   = data.get("levels", {})
+    trend    = data.get("trend", {})
+    trend_4h = data.get("trend_4h", {})
+    bb       = data.get("bb_1h", {})
+    bottom   = data.get("bottom", {})
+    ema_r    = data.get("ema_ribbon", {})
+    weekly   = data.get("history", {}).get("weekly", {})
+    support  = levels.get("support", 0)
+    resistance = levels.get("resistance", 0)
+    now      = time.time()
 
-    now = time.time()
+    cd4 = trend_4h.get("consecutive_down", 0)
+    cu4 = trend_4h.get("consecutive_up",   0)
+    d4  = trend_4h.get("direction", "")
+    cd1 = trend.get("consecutive_down", 0)
+    cu1 = trend.get("consecutive_up",   0)
 
-    logger.info(f"alert_scanner: score={score} price={price:.2f} rsi={rsi} macd={macd_cross} "
-                f"trend={direction}({consec_down}↓/{consec_up}↑)")
+    e9  = ema_r.get("ema9",  0)
+    e21 = ema_r.get("ema21", 0)
 
-    # ── ATL-алерт ────────────────────────────────────────────────────────────
-    weekly      = data.get("history", {}).get("weekly", {})
-    atl         = weekly.get("atl", 0)
-    pct_from_atl = weekly.get("pct_from_atl", 999)
+    logger.info(
+        f"signal_scanner: score={score:+d} price={price:.2f} "
+        f"RSI1h={rsi_1h} RSI4h={rsi_4h} "
+        f"1H={trend.get('direction')}({cd1}↓/{cu1}↑) "
+        f"4H={d4}({cd4}↓/{cu4}↑)"
+    )
 
+    # Обновляем уровни для price_watcher
+    context.bot_data["support"]    = support
+    context.bot_data["resistance"] = resistance
+
+    # ── ATL алерт ────────────────────────────────────────────────────────────
+    atl = weekly.get("atl", 0)
+    pct_atl = weekly.get("pct_from_atl", 999)
     if atl and price:
         if _atl_alert_sent and price > atl * 1.15:
             _atl_alert_sent = 0.0
-
         if not _atl_alert_sent:
             if price <= atl:
                 msg = (
                     f"🔥 НОВЫЙ ИСТОРИЧЕСКИЙ МИНИМУМ — TAO\n"
                     f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 Цена: ${price:,.2f}  ← НИЖЕ ATL!\n"
-                    f"📉 Предыдущий ATL: ${atl:,.2f}\n"
-                    f"📉 RSI 1H: {rsi}\n\n"
-                    f"🟢 По оценке бота — ЛУЧШАЯ ТОЧКА ВХОДА\n"
-                    f"Такого не было никогда. Заходи частями или жди подтверждения.\n\n"
-                    f"👉 «📊 Анализ TAO» — полный план"
+                    f"💰 ${price:,.2f} — НИЖЕ ВСЕХ ATL!\n"
+                    f"📉 RSI 1H: {rsi_1h}\n\n"
+                    f"🟢 Исторически — лучшая точка входа\n"
+                    f"Заходи частями, не всей суммой сразу"
                 )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
+                await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
                 _atl_alert_sent = price
-                logger.info(f"alert_scanner: NEW ATL price={price:.2f} atl={atl:.2f}")
-            elif pct_from_atl <= 10:
+            elif pct_atl <= 8:
                 msg = (
                     f"🚨 TAO У ИСТОРИЧЕСКОГО МИНИМУМА\n"
                     f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 ${price:,.2f}  |  ATL: ${atl:,.2f}  (+{pct_from_atl:.1f}% от дна)\n"
-                    f"📉 RSI 1H: {rsi}  |  Счёт: {score:+d}/10\n\n"
-                    f"🟢 ЗОНА КАПИТУЛЯЦИИ — исторически лучшие точки входа\n"
-                    f"Рассмотри вход частями\n\n"
-                    f"👉 «📊 Анализ TAO» — полный план"
+                    f"💰 ${price:,.2f}  |  ATL: ${atl:,.2f}  (+{pct_atl:.1f}%)\n"
+                    f"RSI 1H: {rsi_1h}  |  RSI 4H: {rsi_4h}\n\n"
+                    f"🟢 ЗОНА КАПИТУЛЯЦИИ — исторически выгодно\n"
+                    f"Нажми «Анализ TAO» для полного плана"
                 )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
+                await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
                 _atl_alert_sent = price
-                logger.info(f"alert_scanner: ATL zone price={price:.2f} pct={pct_from_atl:.1f}%")
 
-    # ── BOTTOM PATTERNS — главный блок новых алертов ─────────────────────────
-    bottom = data.get("bottom", {})
-    bottom_score    = bottom.get("bottom_score", 0)
-    bottom_desc     = bottom.get("description", [])
-    triple_bottom   = bottom.get("multiple_bottom", False)
-    bottom_level    = bottom.get("bottom_level", 0.0)
-    bottom_touches  = bottom.get("bottom_touches", 0)
-    capit_drop      = bottom.get("capitulation_drop", False)
-    drop_pct        = bottom.get("drop_pct", 0.0)
-    vol_climax      = bottom.get("volume_climax", False)
-    vol_ratio       = bottom.get("volume_climax_ratio", 0.0)
-    rsi_div         = bottom.get("rsi_divergence", False)
-    hammer          = bottom.get("hammer_reversal", False)
+    # ── Bottom patterns ───────────────────────────────────────────────────────
+    bs        = bottom.get("bottom_score", 0)
+    vol_clim  = bottom.get("volume_climax", False)
+    vol_ratio = bottom.get("volume_climax_ratio", 0.0)
+    triple    = bottom.get("multiple_bottom", False)
+    bl        = bottom.get("bottom_level", 0.0)
+    bt        = bottom.get("bottom_touches", 0)
+    capit     = bottom.get("capitulation_drop", False)
+    drop_pct  = bottom.get("drop_pct", 0.0)
+    rsi_div   = bottom.get("rsi_divergence", False)
+    hammer    = bottom.get("hammer_reversal", False)
 
-    # ── 1. Тройное/четвертное дно — сильнейший сигнал ──────────────────────────
-    if triple_bottom and bottom_level > 0:
-        level_changed = abs(bottom_level - _triple_bottom_level) > bottom_level * 0.03
-        cooldown_ok   = now - _triple_bottom_alert_ts >= 3600  # раздельный кулдаун (BUG #6)
+    if triple and bl > 0 and now - _bottom_alert_ts >= 3600:
+        extras = []
+        if vol_clim:  extras.append(f"📊 Объём {vol_ratio:.1f}x — продавцы выдохлись")
+        if rsi_div:   extras.append("📈 RSI дивергенция — разворот подтверждён")
+        if hammer:    extras.append("🔨 Молот — покупатели защищают дно")
+        extras_str = ("\n" + "\n".join(extras)) if extras else ""
+        msg = (
+            f"🔁 ТРОЙНОЕ ДНО — СИГНАЛ ВХОДА — TAO\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 ${price:,.2f}  |  Уровень: ${bl:,.2f}  ({bt} касания)\n"
+            f"📉 RSI 1H: {rsi_1h}  |  RSI 4H: {rsi_4h}\n"
+            f"Сила паттерна: {bs}/10{extras_str}\n\n"
+            f"📌 Рынок {bt} раза защитил уровень ${bl:,.2f}\n"
+            f"💡 Вход: у ${bl:,.2f}  |  Стоп: ${bl*0.97:,.2f}\n"
+            f"Цель 1: ${bl*1.03:,.2f} (+3%)  |  Цель 2: ${bl*1.08:,.2f} (+8%)"
+        )
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
+        _bottom_alert_ts = now
+        logger.info(f"TRIPLE BOTTOM: level={bl:.2f} score={bs}")
 
-        if cooldown_ok and level_changed:
-            extra_signals = []
-            if vol_climax: extra_signals.append(f"📊 Объём {vol_ratio:.1f}x — продавцы выдохлись")
-            if rsi_div:    extra_signals.append("📈 RSI дивергенция — разворот подтверждён")
-            if hammer:     extra_signals.append("🔨 Молот на уровне — покупатели защищают дно")
-            if capit_drop: extra_signals.append(f"💥 Перед этим был дамп {abs(drop_pct):.1f}% — паника выкуплена")
+    elif capit and not triple and now - _capit_alert_ts >= 1800:
+        extras = []
+        if vol_clim:  extras.append(f"📊 Объём {vol_ratio:.1f}x — паническая продажа")
+        if rsi_div:   extras.append("📈 RSI дивергенция — ослабление импульса")
+        if rsi_1h < 30: extras.append(f"💎 RSI {rsi_1h} — перепродан")
+        extras_str = ("\n" + "\n".join(extras)) if extras else ""
+        msg = (
+            f"💥 КАПИТУЛЯЦИЯ — TAO\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 ${price:,.2f}  ({drop_pct:.1f}% за 3 свечи)\n"
+            f"RSI 1H: {rsi_1h}  |  RSI 4H: {rsi_4h}{extras_str}\n\n"
+            f"⚠️ НЕ входи сразу — жди 2 зелёных свечи подряд\n"
+            f"Поддержка: ${support:,.2f}"
+        )
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
+        _capit_alert_ts = now
+        logger.info(f"CAPITULATION: drop={drop_pct:.1f}%")
 
-            extra_str  = ("\n" + "\n".join(extra_signals)) if extra_signals else ""
-            confidence = "🔥 ОЧЕНЬ ВЫСОКАЯ" if bottom_score >= 6 else "⚡ ВЫСОКАЯ" if bottom_score >= 4 else "🟡 СРЕДНЯЯ"
-
+    # ── Нисходящий тренд на 4H — блок входа ──────────────────────────────────
+    is_downtrend = (d4 == "down" and cd4 >= 3)
+    if is_downtrend and score <= 1:
+        cd_ok = now - _downtrend_ts >= 3600
+        score_dropped = _last_score >= 2
+        if cd_ok or score_dropped:
             msg = (
-                f"🔁 ТРОЙНОЕ ДНО — TAO | ТОЧКА ВХОДА\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Цена: ${price:,.2f}\n"
-                f"🎯 Уровень поддержки: ${bottom_level:,.2f}  ({bottom_touches} касания)\n"
-                f"📊 Сила сигнала: {confidence} ({bottom_score}/10)\n"
-                f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n"
-                f"{extra_str}\n\n"
-                f"📌 Рынок 3+ раз отбился от одного уровня — продавцы истощены.\n"
-                f"Чем больше касаний = тем сильнее поддержка.\n\n"
-                f"💡 Тактика: вход частями у ${bottom_level:,.2f}, стоп ниже ${bottom_level * 0.97:,.2f}\n"
-                f"Цель 1: ${bottom_level * 1.1:,.2f} (+10%)  |  Цель 2: ${bottom_level * 1.2:,.2f} (+20%)"
-            )
-            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            _triple_bottom_alert_ts = now
-            _triple_bottom_level    = bottom_level
-            logger.info(f"TRIPLE BOTTOM alert: level={bottom_level:.2f} touches={bottom_touches} score={bottom_score}")
-
-    # ── 2. Капитуляция — резкое падение без причины ─────────────────────────
-    if capit_drop and not triple_bottom:
-        cooldown_ok = now - _capitulation_alert_ts >= 1800
-        if cooldown_ok:
-            extra_signals = []
-            if vol_climax: extra_signals.append(f"📊 Объём взлетел в {vol_ratio:.1f}x — паническая продажа")
-            if rsi_div:    extra_signals.append("📈 RSI дивергенция — импульс падения слабеет")
-            if hammer:     extra_signals.append("🔨 Молот на последней свече — первый признак разворота")
-            if rsi < 30:   extra_signals.append(f"💎 RSI {rsi} — перепродан, отскок вероятен")
-            extra_str = ("\n" + "\n".join(extra_signals)) if extra_signals else ""
-
-            intensity = "🔴 СИЛЬНАЯ" if abs(drop_pct) >= 8 else "🟠 УМЕРЕННАЯ"
-            msg = (
-                f"💥 КАПИТУЛЯЦИЯ — TAO УПАЛ ИЗ НИОТКУДА\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Цена: ${price:,.2f}  ({drop_pct:.1f}% за 3 свечи)\n"
-                f"⚡ Интенсивность: {intensity}\n"
-                f"📉 RSI 1H: {rsi}  |  Страх/жадность: {data.get('fear_greed',{}).get('value',50)}\n"
-                f"{extra_str}\n\n"
-                f"📌 Резкое падение без тренда = паническая продажа.\n"
-                f"После капитуляций статистически часто идёт отскок +5–15%.\n\n"
-                f"⚠️ НЕ входи сразу — жди стабилизации (2 свечи без новых лоу).\n"
-                f"Поддержка: ${support:,.2f}"
-            )
-            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            _capitulation_alert_ts = now
-            logger.info(f"CAPITULATION alert: drop={drop_pct:.1f}% score={bottom_score}")
-
-    # ── 3. Комбо-сигнал: нужен объём + ≥5 баллов (BUG #5, раздельный кулдаун BUG #6)
-    elif not triple_bottom and not capit_drop and bottom_score >= 5 and vol_climax:
-        cooldown_ok = now - _combo_bottom_alert_ts >= 2700  # раздельный кулдаун
-        if cooldown_ok:
-            signals_str = "\n".join(f"• {d}" for d in bottom_desc)
-            msg = (
-                f"🟢 ЗОНА НАКОПЛЕНИЯ — TAO\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Цена: ${price:,.2f}  |  Сила сигнала: {bottom_score}/10\n"
-                f"📉 RSI 1H: {rsi}  |  RSI 4H: {data.get('rsi_4h', 50)}\n"
-                f"📊 Объём {vol_ratio:.1f}x от среднего — покупатели входят\n\n"
-                f"Зафиксированы паттерны дна:\n{signals_str}\n\n"
-                f"💡 Рассмотри вход небольшой частью позиции"
-            )
-            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            _combo_bottom_alert_ts = now
-            logger.info(f"COMBO bottom alert: score={bottom_score} vol={vol_ratio:.1f}x patterns={len(bottom_desc)}")
-
-    # ── Нисходящий тренд — предупреждение (BUG #9: раздельный кулдаун) ──────
-    if direction == "down" and consec_down >= 3 and score <= 1:
-        # Шлём только когда скор ТОЛЬКО ЧТО упал ниже 2 или прошёл кулдаун
-        score_just_dropped = last_alert_score >= 2
-        cooldown_ok        = now - _downtrend_warning_ts >= 3600  # не чаще раза в час
-        if score_just_dropped or cooldown_ok:
-            stoch_k = stoch.get("k", 50)
-            msg = (
-                f"⚠️ TAO: АКТИВНЫЙ НИСХОДЯЩИЙ ТРЕНД\n"
+                f"⛔ TAO: НЕ ВХОДИТЬ — НИСХОДЯЩИЙ ТРЕНД\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 ${price:,.2f}  |  Счёт: {score:+d}/10\n"
-                f"📉 {consec_down} свечей подряд вниз\n"
-                f"RSI 1H: {rsi}  |  Stoch RSI K: {stoch_k:.0f}\n\n"
-                f"🔒 Сигнал заблокирован — не торгуй против тренда\n"
-                f"Жди: 2 зелёных свечи подряд + RSI разворот"
+                f"💰 ${price:,.2f}  |  Счёт: {score:+d}/8\n"
+                f"📉 4H: {cd4} свечей вниз подряд\n"
+                f"RSI 1H: {rsi_1h}  |  RSI 4H: {rsi_4h}\n\n"
+                f"🔒 Торговля заблокирована\n"
+                f"Жди: разворот на 4H (2 зелёных свечи) + RSI > 40"
             )
-            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-            _downtrend_warning_ts = now
-            logger.info(f"alert_scanner: downtrend warning sent consec={consec_down}")
-        last_alert_score = score
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
+            _downtrend_ts = now
+            logger.info(f"DOWNTREND BLOCK: 4H {cd4}↓")
+        _last_score = score
         return
 
-    # ── Позитивные / негативные сигналы ──────────────────────────────────────
-    # BUG #1 и #14 исправлены: last_alert_score обновляется ТОЛЬКО после отправки
-    if score >= 5 and last_alert_score < 5:
-        # Кулдаун: если последний алерт был ≥4 менее 20 мин назад — пропускаем
-        if now - last_alert_ts < 1200 and last_alert_score >= 4:
-            return  # не обновляем last_alert_score (BUG #14)
-        stoch_k  = stoch.get("k", 50)
-        macd_str = "\n⚡ MACD бычий кросс — импульс пошёл" if macd_cross == "bullish" else ""
-        sup_str  = f"\n🎯 Поддержка: ${support:,.2f}" if support else ""
-        stoch_str = f"\n🎲 Stoch RSI: {stoch_k:.0f} (перепродан)" if stoch_k < 25 else ""
-        bb_lower = bb.get("lower", 0)
-        bb_str   = f"\n📐 У нижней BB (${bb_lower:,.2f})" if bb_lower and price <= bb_lower * 1.01 else ""
+    # ── ОСНОВНЫЕ СИГНАЛЫ: ВОЙТИ / ВЫЙТИ ──────────────────────────────────────
+    cooldown_ok = now - _last_alert_ts >= 600   # минимум 10 мин между одинаковыми алертами
+
+    # ── СИГНАЛ ВОЙТИ ─────────────────────────────────────────────────────────
+    if score >= 4 and _last_signal_dir != "buy":
+        if not cooldown_ok and _last_score >= 4:
+            _last_score = score
+            return
+
+        stoch_k = stoch.get("k", 50)
+        macd_cross = macd_1h.get("cross", "none")
+        bb_l = bb.get("lower", 0)
+
+        # Строим детали
+        details = []
+        if rsi_1h < 35:  details.append(f"RSI 1H = {rsi_1h} — перепродан ✅")
+        if rsi_4h < 40:  details.append(f"RSI 4H = {rsi_4h} — перепродан на 4H ✅")
+        if stoch_k < 25: details.append(f"Stoch RSI = {stoch_k:.0f} — экстремальная перепроданность ✅")
+        if macd_cross == "bullish": details.append("MACD бычий кросс ✅")
+        if support and price <= support * 1.015: details.append(f"Цена у поддержки ${support:,.2f} ✅")
+        if bb_l and price <= bb_l * 1.01: details.append(f"Цена у нижней BB ✅")
+        if cu4 >= 2: details.append(f"4H: {cu4} зелёных свечи подряд ✅")
+
+        tp1 = price * 1.015
+        tp2 = resistance * 0.99 if resistance and resistance > price else price * 1.04
+        sl  = support * 0.985 if support else price * 0.97
+        urgency = "🚀 СИЛЬНЫЙ" if score >= 6 else "🟢"
+
         msg = (
-            f"🚨 СИЛЬНЫЙ СИГНАЛ — ВХОДИ — TAO\n"
+            f"{urgency} СИГНАЛ ВХОДА — TAO\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🟢 Счёт: {score:+d}/10  |  Тренд: ↑\n"
-            f"💰 Цена: ${price:,.2f}\n"
-            f"📉 RSI 1H: {rsi}{stoch_str}{macd_str}{sup_str}{bb_str}\n\n"
+            f"💰 Цена: ${price:,.2f}  |  Счёт: {score:+d}/8\n"
+            f"📉 RSI 1H: {rsi_1h}  |  RSI 4H: {rsi_4h}\n"
+            f"📈 1H: {trend.get('direction')} | 4H: {d4}\n\n"
+        )
+        if details:
+            msg += "✅ Подтверждения:\n" + "\n".join(f"  • {d}" for d in details) + "\n\n"
+        msg += (
+            f"💡 ЧТО ДЕЛАТЬ:\n"
+            f"  Вход:  ~${price:,.2f}\n"
+            f"  TP1:   ${tp1:,.2f} (+1.5%)\n"
+            f"  TP2:   ${tp2:,.2f}\n"
+            f"  Стоп:  ${sl:,.2f}\n\n"
             f"👉 «📊 Анализ TAO» — полный план"
         )
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts    = now
-        last_alert_score = score  # обновляем только после отправки
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
+        _last_alert_ts   = now
+        _last_signal_dir = "buy"
+        _last_score      = score
+        logger.info(f"BUY SIGNAL: score={score} price={price:.2f} rsi={rsi_1h}")
 
-    elif score >= 3 and last_alert_score < 3:
-        if now - last_alert_ts < 1200:
-            return  # не обновляем last_alert_score (BUG #14)
-        msg = (
-            f"🟢 TAO — ВХОДИТЬ\n"
-            f"💰 ${price:,.2f}  |  RSI {rsi}  |  Счёт {score:+d}/10\n"
-            f"Условия хорошие. Смотри полный анализ для точки входа."
-        )
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts    = now
-        last_alert_score = score
-
-    elif score >= 1 and last_alert_score < 1:
-        if now - last_alert_ts < 2400:
+    # ── СИГНАЛ ВЫЙТИ ─────────────────────────────────────────────────────────
+    elif score <= -4 and _last_signal_dir != "sell":
+        if not cooldown_ok and _last_score <= -4:
+            _last_score = score
             return
-        msg = (
-            f"🟡 TAO — МОЖНО ВОЙТИ МАЛОЙ ЧАСТЬЮ\n"
-            f"💰 ${price:,.2f}  |  RSI {rsi}  |  Счёт {score:+d}/10\n"
-            f"Слабый сигнал — только малой частью и с подтверждением."
-        )
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts    = now
-        last_alert_score = score
 
-    elif score <= -4 and last_alert_score > -4:
+        details = []
+        if rsi_1h > 65: details.append(f"RSI 1H = {rsi_1h} — перекуплен 🔴")
+        if rsi_4h > 60: details.append(f"RSI 4H = {rsi_4h} — перекуплен на 4H 🔴")
+        if stoch.get("k", 50) > 75: details.append(f"Stoch RSI = {stoch.get('k',50):.0f} — перекуплен 🔴")
+        if macd_1h.get("cross") == "bearish": details.append("MACD медвежий кросс 🔴")
+        if resistance and price >= resistance * 0.99: details.append(f"Цена у сопротивления ${resistance:,.2f} 🔴")
+        if cd4 >= 2: details.append(f"4H: {cd4} красных свечи подряд 🔴")
+
         msg = (
-            f"🔴 НЕ ВХОДИ — TAO\n"
+            f"🔴 СИГНАЛ ВЫХОДА / НЕ ВХОДИТЬ — TAO\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"Счёт: {score:+d}/10 — высокий риск\n"
-            f"💰 ${price:,.2f}  |  RSI {rsi}\n"
-            f"Жди разворота."
+            f"💰 Цена: ${price:,.2f}  |  Счёт: {score:+d}/8\n"
+            f"RSI 1H: {rsi_1h}  |  RSI 4H: {rsi_4h}\n"
+            f"4H тренд: {d4}\n\n"
         )
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=get_keyboard())
-        last_alert_ts    = now
-        last_alert_score = score
+        if details:
+            msg += "🔴 Причины:\n" + "\n".join(f"  • {d}" for d in details) + "\n\n"
+        msg += (
+            f"💡 ЧТО ДЕЛАТЬ:\n"
+            f"  • Если в позиции — зафиксируй прибыль\n"
+            f"  • Не открывай новые лонги\n"
+            f"  • Жди следующего дна для входа\n\n"
+            f"👉 «📊 Анализ TAO» — подробнее"
+        )
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=_kb(alerts_enabled))
+        _last_alert_ts   = now
+        _last_signal_dir = "sell"
+        _last_score      = score
+        logger.info(f"SELL SIGNAL: score={score} price={price:.2f} rsi={rsi_1h}")
 
+    # Сброс направления когда сигнал нейтральный
+    elif -3 < score < 3:
+        if _last_signal_dir:
+            _last_signal_dir = ""
+        _last_score = score
     else:
-        # Нет нового алерта — всё равно обновляем скор для следующего цикла
-        last_alert_score = score
+        _last_score = score
 
 
 # ─── команды ─────────────────────────────────────────────────────────────────
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📊 TAO Signal Bot v2\n"
+        "📊 TAO Signal Bot v4 — Скальпинг\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
-        "📊 Анализ TAO — RSI, Stoch RSI, MACD, BB,\n"
-        "   тренд, MA/EMA, история, план входа\n"
-        "🪙 AI Монеты — RENDER, FET, WLD, INJ,\n"
-        "   OCEAN, AR, GRT → тапни → полный анализ\n"
-        "🔔 Алерты — каждые 2 мин (цена) + 15 мин (сигнал)\n"
-        "   ⚠️ Бот блокирует входы при нисходящем тренде\n\n"
-        "⚙️ Помощь — полная инструкция\n\n"
-        "Поехали!",
-        reply_markup=get_keyboard()
+        "Я слежу за TAO 24/7 и сигналю:\n"
+        "🟢 ВОЙТИ — когда цена у дна с подтверждениями\n"
+        "🔴 ВЫЙТИ — когда цена у пика, риск разворота\n"
+        "⚡ Быстрые алерты — резкие движения за 1 мин\n\n"
+        "📊 Анализ TAO — полный отчёт прямо сейчас\n"
+        "🪙 AI Монеты — сканер 7 монет\n"
+        "📰 Новости — свежие новости TAO\n"
+        "🔔 Алерты — вкл/выкл уведомления\n\n"
+        "⚠️ Не финансовый совет. Торгуй осознанно.",
+        reply_markup=_kb(alerts_enabled),
     )
 
 
 async def cmd_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Анализирую TAO...")
+    await update.message.reply_text("⏳ Анализирую...")
     await run_analysis(context=context, update=update, symbol="TAOUSDT")
 
 
@@ -492,208 +506,341 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Ищу новости...")
     try:
         news = get_all_news()
-        lines = ["📰 СВЕЖИЕ НОВОСТИ\n"]
-
-        tao_news = news.get("tao_news", [])
-        if tao_news:
-            lines.append("🔵 TAO / BITTENSOR:")
-            for item in tao_news:
-                icon = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}.get(item.get("sentiment", ""), "⚪")
-                lines.append(f"{icon} {item['title'][:100]}")
-                lines.append(f"  [{item['source']}]")
-                lines.append("")
-        else:
-            lines.append("По TAO новостей нет прямо сейчас.\n")
-
-        ai_news = news.get("ai_news", [])
-        if ai_news:
-            lines.append("🤖 AI НОВОСТИ:")
-            for item in ai_news[:3]:
-                lines.append(f"• {item['title'][:100]}")
-                lines.append(f"  [{item['source']}]")
-                lines.append("")
-
-        overall = news.get("overall_sentiment", "neutral")
-        sent_icon = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}.get(overall, "⚪")
-        lines.append(f"\n{sent_icon} Общий тон новостей по TAO: {overall.upper()}")
-
-        cg = news.get("coingecko", {})
-        if cg.get("market_cap_rank"):
-            lines.append(f"📊 CoinGecko rank: #{cg['market_cap_rank']}")
-        if cg.get("sentiment_votes_up"):
-            lines.append(f"👍 Sentiment votes up: {cg['sentiment_votes_up']:.0f}%")
-
-        await update.message.reply_text("\n".join(lines), reply_markup=get_keyboard())
+        lines = ["📰 НОВОСТИ TAO\n"]
+        for item in news.get("tao_news", [])[:4]:
+            icon = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}.get(item.get("sentiment", ""), "⚪")
+            lines.append(f"{icon} {item['title'][:100]}")
+            lines.append(f"  [{item['source']}]\n")
+        for item in news.get("ai_news", [])[:2]:
+            lines.append(f"🤖 {item['title'][:100]}")
+        if not news.get("tao_news") and not news.get("ai_news"):
+            lines.append("Новостей нет прямо сейчас.")
+        await update.message.reply_text("\n".join(lines), reply_markup=_kb(alerts_enabled))
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_ai_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Сканирую AI-монеты...")
+    msg = await update.message.reply_text("⏳ Сканирую AI монеты...")
     buttons = []
-
     for symbol, name, emoji in AI_COINS:
         try:
-            scan       = quick_scan_coin(symbol)
-            price      = scan.get("price", 0)
-            change     = scan.get("change_24h", 0)
-            rsi        = scan.get("rsi_1h", 50)
-            macd_cross = scan.get("macd", {}).get("cross", "none")
-            trend_dir  = scan.get("trend", {}).get("direction", "")
-            consec_down = scan.get("trend", {}).get("consecutive_down", 0)
+            s = quick_scan_coin(symbol)
+            price  = s.get("price", 0)
+            change = s.get("change_24h", 0)
+            rsi    = s.get("rsi_1h", 50)
+            macd_x = s.get("macd", {}).get("cross", "none")
+            d4     = s.get("trend_4h", {}).get("direction", "")
+            cd4    = s.get("trend_4h", {}).get("consecutive_down", 0)
 
-            score = 0
-            if rsi < 30:      score += 2
-            elif rsi < 42:    score += 1
-            elif rsi > 75:    score -= 2
-            elif rsi > 65:    score -= 1
-            if macd_cross == "bullish":  score += 2
-            elif macd_cross == "bearish": score -= 2
-            if change > 3:    score += 1
-            elif change < -5: score -= 1
-            if trend_dir == "down": score -= 2
-            elif trend_dir == "up": score += 1
+            sc = 0
+            if rsi < 30:   sc += 2
+            elif rsi < 42: sc += 1
+            elif rsi > 70: sc -= 2
+            elif rsi > 60: sc -= 1
+            if macd_x == "bullish":  sc += 2
+            elif macd_x == "bearish": sc -= 2
+            if change > 3:  sc += 1
+            elif change < -5: sc -= 1
+            if d4 == "down": sc -= 2
+            elif d4 == "up": sc += 1
 
-            if score >= 3:    status = "🟢"
-            elif score >= 1:  status = "🟡"
-            elif score <= -3: status = "🔴"
-            elif score <= -1: status = "🟠"
-            else:             status = "⚪"
-
-            change_sign = "+" if change > 0 else ""
-            macd_str    = " ⚡" if macd_cross == "bullish" else ""
-            trend_str   = " ↓↓" if (trend_dir == "down" and consec_down >= 3) else (" ↓" if trend_dir == "down" else "")
-            label = f"{status} {emoji} {name}   ${price:,.4g}   {change_sign}{change:.1f}%   RSI {rsi}{macd_str}{trend_str}"
+            st = "🟢" if sc >= 3 else ("🟡" if sc >= 1 else ("🔴" if sc <= -3 else ("🟠" if sc <= -1 else "⚪")))
+            cs = "+" if change > 0 else ""
+            macd_s  = " ⚡" if macd_x == "bullish" else ""
+            trend_s = " ↓↓" if (d4 == "down" and cd4 >= 3) else (" ↓" if d4 == "down" else "")
+            label = f"{st} {emoji} {name}   ${price:,.4g}   {cs}{change:.1f}%   RSI {rsi}{macd_s}{trend_s}"
             buttons.append([InlineKeyboardButton(label, callback_data=f"coin_{symbol}")])
         except Exception:
             buttons.append([InlineKeyboardButton(f"⚪ {emoji} {name}   —", callback_data=f"coin_{symbol}")])
 
-    kb = InlineKeyboardMarkup(buttons)
     await msg.edit_text(
-        "🪙 AI МОНЕТЫ ДЛЯ СКАЛЬПИНГА\n"
-        "Нажми на монету — полный анализ\n\n"
-        "🟢 хороший вход  🟡 осторожно  🟠 ждать\n"
-        "🔴 не входить  ⚡ MACD кросс  ↓↓ тренд вниз",
-        reply_markup=kb
+        "🪙 AI МОНЕТЫ\nНажми — полный анализ\n\n"
+        "🟢 войти  🟡 осторожно  🟠 ждать  🔴 не входить  ⚡ MACD кросс",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def cb_coin_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    symbol = query.data.replace("coin_", "")
+async def cb_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    symbol = q.data.replace("coin_", "")
     name   = symbol.replace("USDT", "")
-    await query.message.reply_text(f"⏳ Анализирую {name}...")
+    await q.message.reply_text(f"⏳ Анализирую {name}...")
     try:
         data   = collect_all_data(symbol)
-        signal = generate_signal(data, {"tao_news": [], "ai_news": []})
-        report = format_report(data, {"tao_news": [], "ai_news": []}, signal)
-        await query.message.reply_text(report, reply_markup=get_keyboard())
+        signal = generate_signal(data, {})
+        report = format_report(data, {}, signal)
+        await q.message.reply_text(report, reply_markup=_kb(alerts_enabled))
     except Exception as e:
-        await query.message.reply_text(f"❌ Ошибка анализа {name}: {str(e)[:100]}")
+        await q.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
 
 
 async def cmd_toggle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global alerts_enabled
     alerts_enabled = not alerts_enabled
-    status = "ВКЛ 🔔" if alerts_enabled else "ВЫКЛ 🔕"
-    await update.message.reply_text(
-        f"Алерты: {status}\n\n"
-        f"{'Буду присылать уведомления, блокируя ложные сигналы при нисходящем тренде.' if alerts_enabled else 'Алерты отключены.'}",
-        reply_markup=get_keyboard()
-    )
+    s = "включены 🔔" if alerts_enabled else "выключены 🔕"
+    await update.message.reply_text(f"Алерты {s}", reply_markup=_kb(alerts_enabled))
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 КАК ПОЛЬЗОВАТЬСЯ\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
-        "📊 Анализ TAO — полный разбор:\n"
-        "  RSI 1H/4H, Stoch RSI, MACD, Bollinger Bands,\n"
-        "  MA20/MA50/EMA200, тренд, стакан, история\n\n"
-        "🪙 AI Монеты — 7 монет с трендом и скором\n\n"
-        "📰 Новости — с sentiment: 🟢🔴⚪\n\n"
-        "🔔 Алерты:\n"
-        "  • 2 мин — цена: дроп, поддержка, отскок, смена тренда\n"
-        "  • 15 мин — сигнал: RSI+MACD+BB+тренд+BTC\n"
-        "  ⚠️ При нисходящем тренде (3+ свечей вниз)\n"
-        "     сигналы блокируются — бот защищает от ложных входов\n\n"
+        "🟢 СИГНАЛ ВХОДА (score ≥ +4)\n"
+        "   Несколько индикаторов подтверждают дно:\n"
+        "   RSI перепродан + у поддержки + MACD кросс\n"
+        "   → Можно входить с чётким стопом\n\n"
+        "🔴 СИГНАЛ ВЫХОДА (score ≤ -4)\n"
+        "   Несколько индикаторов подтверждают пик:\n"
+        "   RSI перекуплен + у сопротивления\n"
+        "   → Фиксируй прибыль, не открывай лонги\n\n"
+        "⚡ БЫСТРЫЕ АЛЕРТЫ (каждую 1 мин)\n"
+        "   • Резкий дроп -1.5% — предупреждение\n"
+        "   • Резкий рост +1.5% — предупреждение о пике\n"
+        "   • Цена у поддержки/сопротивления\n\n"
+        "📊 Полный анализ — каждые 6 часов + 9:00\n\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "СИГНАЛЫ:\n"
-        "🟢 СИЛЬНЫЙ ВХОД (≥5) — идеальные условия\n"
-        "🟢 ВХОДИТЬ (3-4) — хорошие условия\n"
-        "🟡 ОСТОРОЖНО (1-2) — малой частью\n"
-        "⚪ НЕЙТРАЛЬНО (0) — нет сигнала\n"
-        "🟠 ЖДАТЬ (-1 до -2)\n"
-        "🔴 НЕ ВХОДИТЬ (-3 и ниже)\n"
-        "🔴 ВЫХОДИТЬ (-5 и ниже)\n\n"
+        "СЧЁТ:\n"
+        "+6..+8  🚀 СИЛЬНЫЙ ВХОД\n"
+        "+4..+5  🟢 ВОЙТИ\n"
+        "+2..+3  🟡 Присматривайся\n"
+        "0..±1   ⚪ Ждать\n"
+        "-2..-3  🟠 Готовься к выходу\n"
+        "-4..-5  🔴 ВЫЙТИ / НЕ ВХОДИТЬ\n"
+        "-6..-8  🔴 СИЛЬНЫЙ ВЫХОД\n\n"
         "⚠️ Не финансовый совет!",
-        reply_markup=get_keyboard()
+        reply_markup=_kb(alerts_enabled),
     )
 
 
+async def _ask_claude(question: str, market_data: dict = None) -> str:
+    """Отправляет вопрос в Claude с контекстом рынка. Возвращает ответ."""
+    claude = _get_claude()
+    if not claude:
+        return "⚠️ Claude API не подключён. Добавь ANTHROPIC_API_KEY в .env"
+
+    # Считаем скор сигнала — главный факт для Claude
+    signal_score = 0
+    signal_label = "НЕЙТРАЛЬНЫЙ (ждать)"
+    if market_data:
+        try:
+            signal_score = quick_signal_score(market_data)
+            if signal_score >= 6:
+                signal_label = f"СИЛЬНЫЙ СИГНАЛ ВХОДА (счёт {signal_score:+d}/8)"
+            elif signal_score >= 4:
+                signal_label = f"СИГНАЛ ВХОДА (счёт {signal_score:+d}/8)"
+            elif signal_score >= 2:
+                signal_label = f"СЛАБЫЙ СИГНАЛ ВХОДА (счёт {signal_score:+d}/8) — осторожно"
+            elif signal_score <= -6:
+                signal_label = f"СИЛЬНЫЙ СИГНАЛ ВЫХОДА (счёт {signal_score:+d}/8)"
+            elif signal_score <= -4:
+                signal_label = f"СИГНАЛ ВЫХОДА / НЕ ВХОДИТЬ (счёт {signal_score:+d}/8)"
+            elif signal_score <= -2:
+                signal_label = f"СЛАБЫЙ СИГНАЛ ВЫХОДА (счёт {signal_score:+d}/8) — осторожно"
+            else:
+                signal_label = f"НЕЙТРАЛЬНЫЙ, ждать (счёт {signal_score:+d}/8)"
+        except Exception:
+            pass
+
+    # Собираем контекст рынка для Claude
+    ctx = ""
+    if market_data:
+        tao   = market_data.get("tao", {})
+        rsi1  = market_data.get("rsi_1h", 50)
+        rsi4  = market_data.get("rsi_4h", 50)
+        tr4   = market_data.get("trend_4h", {})
+        tr1   = market_data.get("trend", {})
+        lvl   = market_data.get("levels", {})
+        ema_r = market_data.get("ema_ribbon", {})
+        macd  = market_data.get("macd_1h", {})
+        bb    = market_data.get("bb_1h", {})
+        fg    = market_data.get("fear_greed", {})
+        price = tao.get("price", 0)
+        sup   = lvl.get("support", 0)
+        res   = lvl.get("resistance", 0)
+
+        # Контекст положения цены
+        loc_note = ""
+        if sup and res and price:
+            rng = res - sup
+            if rng > 0:
+                pct_in_range = (price - sup) / rng * 100
+                if pct_in_range >= 80:
+                    loc_note = "⚠️ Цена в верхних 20% диапазона — зона продаж!"
+                elif pct_in_range <= 20:
+                    loc_note = "✅ Цена в нижних 20% диапазона — зона покупок"
+                else:
+                    loc_note = f"Цена в середине диапазона ({pct_in_range:.0f}%)"
+            if res and price >= res * 0.99:
+                loc_note = "🚫 Цена У СОПРОТИВЛЕНИЯ — не входить!"
+            elif sup and price <= sup * 1.01:
+                loc_note = "✅ Цена У ПОДДЕРЖКИ — потенциальный вход"
+
+        ctx = (
+            f"\n=== ДАННЫЕ РЫНКА TAO/USDT (РЕАЛЬНЫЕ, СЕЙЧАС) ===\n"
+            f"Цена: ${price:,.2f}  |  Изменение 24ч: {tao.get('change_24h', 0):+.1f}%\n"
+            f"RSI 1H: {rsi1}  |  RSI 4H: {rsi4}\n"
+            f"Тренд 1H: {tr1.get('direction','?')} ({tr1.get('consecutive_down',0)}↓/{tr1.get('consecutive_up',0)}↑)\n"
+            f"Тренд 4H: {tr4.get('direction','?')} ({tr4.get('consecutive_down',0)}↓/{tr4.get('consecutive_up',0)}↑)\n"
+            f"Поддержка: ${sup:,.2f}  |  Сопротивление: ${res:,.2f}\n"
+            f"Положение цены: {loc_note}\n"
+            f"EMA 9/21/50: {ema_r.get('ema9',0):.2f}/{ema_r.get('ema21',0):.2f}/{ema_r.get('ema50',0):.2f}\n"
+            f"MACD кросс: {macd.get('cross','none')}\n"
+            f"BB нижняя: ${bb.get('lower',0):,.2f}  |  BB верхняя: ${bb.get('upper',0):,.2f}\n"
+            f"Страх/жадность: {fg.get('value',50)} ({fg.get('label','')})\n"
+            f"\n=== СИГНАЛ АЛГОРИТМА (НЕ МЕНЯТЬ) ===\n"
+            f"ИТОГОВЫЙ ВЫВОД СИСТЕМЫ: {signal_label}\n"
+            f"=== КОНЕЦ ДАННЫХ ===\n"
+        )
+
+    system = (
+        "Ты — торговый ассистент по криптовалюте TAO/USDT (Bittensor). "
+        "Тебе передаются РЕАЛЬНЫЕ рыночные данные и ИТОГОВЫЙ СИГНАЛ алгоритма. "
+        "ВАЖНО: ты НИКОГДА не противоречишь итоговому сигналу алгоритма — он рассчитан по данным, ты его объясняешь. "
+        "Если сигнал 'ВХОДА' — объясняй почему это вход. Если 'ВЫХОДА' — объясняй почему выход. "
+        "Если пользователь переспрашивает или сомневается — держи позицию алгоритма, не меняй вывод. "
+        "Отвечаешь коротко (3-5 предложений), чётко, по делу — как опытный трейдер другу. "
+        "Не пишешь длинных объяснений — только суть и конкретные цифры из данных. "
+        "Отвечаешь на русском. "
+        "В конце одна строка: '⚠️ Не финансовый совет.'"
+    )
+
+    try:
+        resp = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: claude.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                system=system,
+                messages=[{"role": "user", "content": ctx + "\nВопрос пользователя: " + question}],
+            )
+        )
+        return resp.content[0].text
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return f"⚠️ Ошибка Claude: {str(e)[:100]}"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "📊 Анализ TAO":
-        await update.message.reply_text("⏳ Анализирую TAO...")
+    t = update.message.text.strip()
+
+    # ── кнопки меню ──────────────────────────────────────────────────────────
+    if t == "📊 Анализ TAO":
+        await update.message.reply_text("⏳ Анализирую...")
         await run_analysis(context=context, update=update, symbol="TAOUSDT")
-    elif text == "📰 Новости":
+        return
+    elif t == "📰 Новости":
         await cmd_news(update, context)
-    elif text == "🪙 AI Монеты":
+        return
+    elif t == "🪙 AI Монеты":
         await cmd_ai_coins(update, context)
-    elif text in ("🔔 Алерты: ВКЛ", "🔔 Алерты: ВЫКЛ"):
+        return
+    elif "Алерты" in t:
         await cmd_toggle_alerts(update, context)
-    elif text == "⚙️ Помощь":
+        return
+    elif t == "⚙️ Помощь":
         await cmd_help(update, context)
+        return
+
+    # ── быстрые команды без AI ────────────────────────────────────────────────
+    tl = t.lower()
+    if any(w in tl for w in ("цена", "прайс", "price", "сколько стоит", "курс")):
+        ticker = get_tao_ticker()
+        p = ticker.get("price", 0)
+        c = ticker.get("change_24h", 0)
+        icon = "📈" if c > 0 else "📉"
+        await update.message.reply_text(
+            f"{icon} TAO: ${p:,.2f}  ({c:+.1f}% за 24ч)",
+            reply_markup=_kb(alerts_enabled),
+        )
+        return
+
+    if any(w in tl for w in ("анализ", "полный анализ", "сигнал сейчас")):
+        await update.message.reply_text("⏳ Анализирую...")
+        await run_analysis(context=context, update=update, symbol="TAOUSDT")
+        return
+
+    # ── всё остальное → Claude с контекстом рынка ────────────────────────────
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Собираем свежие данные для контекста (быстро — только тикер + кэш)
+    market_data = None
+    try:
+        market_data = collect_all_data("TAOUSDT")
+    except Exception:
+        pass
+
+    answer = await _ask_claude(t, market_data)
+    await update.message.reply_text(answer, reply_markup=_kb(alerts_enabled))
 
 
-# ─── запуск ──────────────────────────────────────────────────────────────────
+# ─── запуск ───────────────────────────────────────────────────────────────────
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
-        BotCommand("start",    "Запустить бота"),
-        BotCommand("analysis", "Анализ TAO прямо сейчас"),
-        BotCommand("coins",    "Список AI-монет"),
-        BotCommand("news",     "Свежие новости TAO и AI"),
+        BotCommand("start",    "Запустить"),
+        BotCommand("analysis", "Анализ TAO"),
+        BotCommand("coins",    "AI монеты"),
+        BotCommand("news",     "Новости"),
         BotCommand("alerts",   "Вкл/выкл алерты"),
-        BotCommand("help",     "Справка по сигналам"),
+        BotCommand("help",     "Помощь"),
     ])
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-    scheduler = AsyncIOScheduler()
-    ctx = type("ctx", (), {"bot": application.bot})()
+    application.bot_data.setdefault("support", 0)
+    application.bot_data.setdefault("resistance", 0)
 
-    scheduler.add_job(price_watcher,  "interval", minutes=2,  kwargs={"context": ctx})
-    scheduler.add_job(alert_scanner,  "interval", minutes=15, kwargs={"context": ctx})
-    scheduler.add_job(run_analysis,   "interval", hours=4,    kwargs={"context": ctx})
+    scheduler = AsyncIOScheduler()
+    ctx = type("ctx", (), {"bot": application.bot, "bot_data": application.bot_data})()
+
+    scheduler.add_job(price_watcher,  "interval", minutes=1,  kwargs={"context": ctx})
+    scheduler.add_job(signal_scanner, "interval", minutes=10, kwargs={"context": ctx})
+    scheduler.add_job(run_analysis,   "interval", hours=6,    kwargs={"context": ctx})
     scheduler.add_job(run_analysis,   "cron", hour=9, minute=0, kwargs={"context": ctx})
 
     scheduler.start()
-    logger.info("Scheduler started: price_watcher 2min / alert_scanner 15min / analysis 4h + 9:00")
+    logger.info("Scheduler: price_watcher 1min / signal_scanner 10min / report 6h + 9:00")
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from telegram.error import Conflict
-    if isinstance(context.error, Conflict):
-        logger.warning("Conflict в error_handler: ждём 40с и продолжаем")
-        await asyncio.sleep(40)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.error import Conflict, NetworkError, TimedOut
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning("Conflict (двойной запуск?) — ждём 45с и продолжаем")
+        await asyncio.sleep(45)
+    elif isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"Network error: {err} — ждём 10с")
+        await asyncio.sleep(10)
     else:
-        logger.error("Unhandled error: %s", context.error)
+        logger.error(f"Unhandled error: {err}")
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",    start))
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан — проверь .env")
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .post_init(post_init)
+        .build()
+    )
+    app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("analysis", cmd_analysis))
     app.add_handler(CommandHandler("coins",    cmd_ai_coins))
     app.add_handler(CommandHandler("news",     cmd_news))
     app.add_handler(CommandHandler("alerts",   cmd_toggle_alerts))
     app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CallbackQueryHandler(cb_coin_analysis, pattern=r"^coin_"))
+    app.add_handler(CallbackQueryHandler(cb_coin, pattern=r"^coin_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("TAO Signal Bot v2 started")
-    app.run_polling(drop_pending_updates=True)
+
+    logger.info("TAO Signal Bot v4 started")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
